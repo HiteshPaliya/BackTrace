@@ -112,6 +112,11 @@ class DatabaseManager:
                 INSERT INTO symbols (
                     file_id, name, kind, start_line, start_col, end_line, end_col, signature, scope
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(file_id, name, kind, start_line, start_col) DO UPDATE SET
+                    end_line = excluded.end_line,
+                    end_col = excluded.end_col,
+                    signature = excluded.signature,
+                    scope = excluded.scope
                 RETURNING symbol_id;
                 """,
                 (

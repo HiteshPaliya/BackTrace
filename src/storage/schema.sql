@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS symbols (
     end_line INTEGER NOT NULL,
     end_col INTEGER NOT NULL,
     signature TEXT,
-    scope TEXT
+    scope TEXT,
+    UNIQUE(file_id, name, kind, start_line, start_col)
 );
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id, name);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
