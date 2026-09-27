@@ -238,6 +238,24 @@ class DatabaseManager:
             row = cursor.fetchone()
             return int(row["edge_id"])
 
+    def get_edges_for_caller(self, caller_symbol_id: int) -> List[Dict[str, Any]]:
+        """Retrieve all outgoing graph edges for a given caller symbol."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM graph_edges WHERE caller_symbol_id = ?;",
+                (caller_symbol_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_symbol_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a symbol by exact name."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM symbols WHERE name = ? LIMIT 1;",
+                (name,),
+            ).fetchone()
+            return dict(row) if row else None
+
     def upsert_vendor_signature(
         self,
         package_name: str,
