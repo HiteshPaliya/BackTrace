@@ -1,0 +1,18 @@
+{
+  "name": "source-code-reviewer",
+  "version": "0.1.0",
+  "description": "Polyglot Cross-File Source Code Security Reviewer",
+  "scripts": {
+    "test": "pytest",
+    "lint": "ruff check .",
+    "format": "ruff format ."
+  },
+  "keywords": [
+    "security",
+    "sast",
+    "code-review",
+    "taint-analysis"
+  ],
+  "author": "Hitesh Paliya",
+  "license": "ISC"
+}

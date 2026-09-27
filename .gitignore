@@ -41,3 +41,4 @@ htmlcov/
 
 # Project Audit State & Outputs
 .audit/
+.superpowers/
