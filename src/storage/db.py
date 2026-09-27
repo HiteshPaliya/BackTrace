@@ -4,8 +4,18 @@ import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
+
+
+class VerdictStatus(str, Enum):
+    """Canonical taint analysis verdict outcomes."""
+
+    EXPLOITABLE = "EXPLOITABLE"
+    LIKELY_EXPLOITABLE_PARTIAL_SANITIZATION = "LIKELY_EXPLOITABLE_PARTIAL_SANITIZATION"
+    SAFE_PROVEN = "SAFE_PROVEN"
+    INSUFFICIENT_CONTEXT = "INSUFFICIENT_CONTEXT"
 
 
 class DatabaseManager:
