@@ -26,7 +26,8 @@ class AuthorizationAnalyzer:
         r"""\b(?:req\.user\.id|token\.sub|session\.userId|current_user\.id|req\.user\.tenantId)\b"""
     )
     UNSCOPED_LOOKUP_PATTERN = re.compile(
-        r"""\b([A-Z][a-zA-Z0-9_]*)\.(?:findByPk|findById|get)\s*\(\s*([a-zA-Z0-9_$.]+)\s*\)"""
+        r"""\b([A-Z][a-zA-Z0-9_]*)\.(?:findByPk|findById|findOne|find|get)\s*\(""",
+        re.IGNORECASE,
     )
     SCOPED_QUERY_PATTERN = re.compile(
         r"""\b([A-Z][a-zA-Z0-9_]*)\.(?:findOne|find|findAll|filter)\s*\(.*?\b(?:userId|ownerid|tenantid)\b""",
@@ -72,11 +73,20 @@ class AuthorizationAnalyzer:
                 relationship_type="OWNER",
             )
 
-        # 4. Check for unscoped primary-key lookups
-        unscoped_match = self.UNSCOPED_LOOKUP_PATTERN.search(code)
-        if unscoped_match:
+        # 4. Check for unscoped lookups (excluding HTTP framework handlers)
+        for unscoped_match in self.UNSCOPED_LOOKUP_PATTERN.finditer(code):
             entity_model = unscoped_match.group(1)
-            op_name = f"{entity_model}.findByPk"
+            if entity_model.lower() in (
+                "app",
+                "router",
+                "express",
+                "req",
+                "request",
+                "res",
+                "response",
+            ):
+                continue
+            op_name = f"{entity_model}.lookup"
             return AuthzAnalysisResult(
                 has_gap=True,
                 gap_type="CANDIDATE_AUTHZ_GAP",

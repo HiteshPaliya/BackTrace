@@ -120,6 +120,10 @@ def scan(target_path: str, workers: int, model: str):
             # Track A: Semantic Sinks
             findings = sem_detector.scan_source(f.rel_path, code, f.language or "")
             for s in findings.sinks:
+                # Invariant 3: Scope-Gated Detector Eligibility
+                if not classifier.eligible_for_detector(f, s.vuln_class):
+                    continue
+
                 db.insert_candidate_sink(
                     file_id=f_id,
                     vuln_class=s.vuln_class,
@@ -267,26 +271,32 @@ def scan(target_path: str, workers: int, model: str):
                 if ep["file_id"] == s["file_id"] or ep["route_pattern"] in s["rel_path"]:
                     matching_ep = ep
                     break
-            if not matching_ep and endpoints:
-                matching_ep = endpoints[0]
 
-            ep_method = matching_ep["http_method"] if matching_ep else "GET"
-            ep_route = (
-                matching_ep["route_pattern"]
-                if matching_ep
-                else f"/{Path(s['rel_path']).stem}"
-            )
-            auth_state = (
-                matching_ep["auth_state"]
-                if matching_ep and "auth_state" in matching_ep.keys()
-                else "NOT_REQUIRED"
-            )
+            # Invariant 4: No arbitrary endpoints[0] fallback!
+            if matching_ep:
+                ep_method = matching_ep["http_method"]
+                ep_route = matching_ep["route_pattern"]
+                auth_state = (
+                    matching_ep["auth_state"]
+                    if "auth_state" in matching_ep.keys()
+                    else "NOT_REQUIRED"
+                )
+                source_control = "CONFIRMED"
+                reach_conf = 0.85
+                transform_status = "FAILED"
+            else:
+                ep_method = None
+                ep_route = None
+                auth_state = "UNKNOWN"
+                source_control = "UNKNOWN"
+                reach_conf = 0.40
+                transform_status = "UNKNOWN"
 
             v_res = verifier.evaluate_contract(
-                source_control="CONFIRMED",
-                reachability_confidence=0.85,
+                source_control=source_control,
+                reachability_confidence=reach_conf,
                 sink_preconditions=f"{s['vuln_class']} execution precondition",
-                transform_status="FAILED",
+                transform_status=transform_status,
                 bypass_reasoning=(
                     f"Tainted input reaches {s['vuln_class']} sink: "
                     f"{s['sink_expression'][:80]}"

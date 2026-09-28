@@ -62,3 +62,22 @@ def test_authz_analyzer_handles_no_object_key():
     route = "function health(req, res) { res.send('ok'); }"
     result = analyzer.analyze_handler("GET", "/health", route, "javascript")
     assert result.has_gap is False
+
+
+def test_authz_analyzer_detects_unscoped_findone_in_juiceshop_basket():
+    """Invariants: BasketModel.findOne({ where: { id } }) flags CANDIDATE_AUTHZ_GAP."""
+    analyzer = AuthorizationAnalyzer()
+    juice_basket_code = """
+        export function retrieveBasket () {
+          return async (req: Request, res: Response, next: NextFunction) => {
+            const id = req.params.id;
+            const basket = await BasketModel.findOne({ where: { id } });
+            res.json(utils.queryResultToJson(basket));
+          }
+        }
+    """
+    res = analyzer.analyze_handler("GET", "/rest/basket/:id", juice_basket_code, "typescript")
+    assert res.has_gap is True
+    assert res.gap_type == "CANDIDATE_AUTHZ_GAP"
+    assert res.object_key == "req.params.id"
+

@@ -25,6 +25,27 @@ BackTrace is engineered to discover high-impact vulnerabilities (e.g., Remote Co
 7. **Resilient Durable State & Strict Version Gating:**  
    Durable SQLite storage (`.audit/audit.db`) with an append-only, thread-safe event log (`.audit/events.jsonl`). An unaffected finding is only reusable across incremental scans if the comprehensive `engine_fingerprint` matches the current run.
 
+### 1.1 Core Architectural Invariants & Soundness Guarantees
+
+BackTrace strictly enforces eight operational invariants to prevent false-positive explosions, syntax collisions, and ungrounded exploit assertions:
+
+1. **Semantic Sink Detection with Argument Analysis:**  
+   Candidate sinks must evaluate argument semantics, not raw identifier text. Hardcoded string literals (e.g. `fetch("https://fixed.example")`, `fs.readFileSync('./swagger.yml')`) and test harness assertions (`request(app)`) are rejected from candidate sink generation. Sinks require variable, dynamic, or user-influenced arguments.
+2. **Mandatory Language/Artifact Constraints:**  
+   Detectors must declare language and artifact boundaries. Template unescape patterns (`!=`) are restricted strictly to template extensions (`.pug`, `.jade`, `.ejs`) and are never evaluated in JavaScript/TypeScript where `!=` and `!==` represent equality comparisons.
+3. **Scope-Gated Detector Eligibility:**  
+   Scope classification precedes candidate generation. Files classified as `TEST_MOCK`, `VENDOR_DEPENDENCY`, or `BUILD_OUTPUT_GENERATED` are evaluated by an eligibility filter (`eligible_for_detector(file, detector)`) and denied from emitting web runtime candidate sinks.
+4. **Zero Endpoint Fallback Binding:**  
+   A finding is bound to an HTTP endpoint only if an unbroken reachability path exists from that route in the CPG. Sinks without a graph-proven route are assigned `reproduction_type = NONE` or `NON_HTTP_TEMPLATE` and marked `INTERNAL_SINK` or `INSUFFICIENT_CONTEXT`. BackTrace forbids fallback assignment to arbitrary endpoints (`endpoints[0]`).
+5. **Direct Import & Alias Resolution:**  
+   Sink classification operates on resolved symbols rather than receiver text. Direct function imports (e.g. `import { parseXmlString } from '../lib/xml'`) resolve to the underlying implementation in the CPG.
+6. **Operation Semantics over Naming Conventions:**  
+   Detectors evaluate operation semantics and argument structure rather than lexical naming conventions (e.g. any receiver `.find(...)` with dynamic query objects or operators, regardless of uppercase or lowercase model names).
+7. **Authoritative Evidence Gate (Zero Manufactured Proofs):**  
+   The Evidence Sufficiency Gate evaluates only real evidence derived from CPG path traversal and contract analysis. The orchestrator is strictly forbidden from supplying synthetic `source_control="CONFIRMED"` or `transform_status="FAILED"` assertions.
+8. **Evidence-Derived Confidence:**  
+   Confidence is calculated strictly from edge resolution quality, path completeness, and contract verification; it must never be assigned a flat or static default.
+
 ---
 
 ## 2. Strict Non-Goals (Boundaries & Constraints)
