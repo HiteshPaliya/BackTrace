@@ -16,7 +16,10 @@ class SemgrepAdapter(ToolAdapter):
 
     def run(self, repo_path: Path, options: Optional[Dict[str, Any]] = None) -> ToolExecutionResult:
         cmd = ["semgrep", "scan", "--json", "--quiet"]
-        return self.execute_command(cmd, cwd=repo_path)
+        res = self.execute_command(cmd, cwd=repo_path)
+        if res.is_available and res.raw_output:
+            res.parsed_items = self.normalize(res.raw_output, repo_path=repo_path)
+        return res
 
     def _infer_vuln_class(self, rule_id: str, message: str) -> str:
         haystack = f"{rule_id} {message}".lower()
@@ -42,7 +45,9 @@ class SemgrepAdapter(ToolAdapter):
             return "MEDIUM"
         return "LOW"
 
-    def normalize(self, raw_output: str) -> List[Dict[str, Any]]:
+    def normalize(
+        self, raw_output: str, repo_path: Optional[Path] = None
+    ) -> List[Dict[str, Any]]:
         """Normalize Semgrep JSON into canonical candidate sink dictionaries."""
         if not raw_output or not raw_output.strip():
             return []
@@ -65,16 +70,24 @@ class SemgrepAdapter(ToolAdapter):
 
             vuln_class = self._infer_vuln_class(check_id, message)
             severity = self._map_severity(extra.get("severity", "ERROR"))
-            start_line = item.get("start", {}).get("line", 1)
+            start_line = int(item.get("start", {}).get("line", 1))
+            rel_path = item.get("path", "")
+
+            sink_expr = raw_lines or message
+            if repo_path and (not raw_lines or raw_lines.lower() == "requires login"):
+                from src.core.workspace import SourceHydrator
+
+                hydrator = SourceHydrator(repo_path)
+                sink_expr = hydrator.hydrate_snippet(rel_path, start_line, sink_expr)
 
             sinks.append(
                 {
-                    "rel_path": item.get("path", ""),
+                    "rel_path": rel_path,
                     "vuln_class": vuln_class,
                     "severity": severity,
-                    "line_number": int(start_line),
+                    "line_number": start_line,
                     "cwe_id": cwe_str or None,
-                    "sink_expression": raw_lines or message,
+                    "sink_expression": sink_expr,
                     "raw_rule_id": check_id,
                     "tool_provenance": "Semgrep",
                 }
