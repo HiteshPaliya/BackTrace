@@ -72,3 +72,41 @@ def test_source_hydrator_handles_missing_file_gracefully(tmp_path: Path):
     hydrator = SourceHydrator(tmp_path)
     snippet = hydrator.hydrate_snippet("nonexistent.ts", 10, "fallback snippet")
     assert snippet == "fallback snippet"
+
+
+def test_scope_detector_eligibility_and_asset_vendor_classification():
+    """Invariants: Vendor scripts in assets classified as VENDOR, and tests denied for web sinks."""
+    three_js = FileInfo(
+        rel_path="frontend/src/assets/private/three.js",
+        abs_path="/repo/frontend/src/assets/private/three.js",
+        language="javascript",
+        is_vendor=False,
+        file_hash="h1",
+        loc=5000,
+    )
+    test_file = FileInfo(
+        rel_path="test/server/basket.test.ts",
+        abs_path="/repo/test/server/basket.test.ts",
+        language="typescript",
+        is_vendor=False,
+        file_hash="h2",
+        loc=80,
+    )
+    prod_file = FileInfo(
+        rel_path="routes/login.ts",
+        abs_path="/repo/routes/login.ts",
+        language="typescript",
+        is_vendor=False,
+        file_hash="h3",
+        loc=50,
+    )
+
+    classifier = ScopeClassifier()
+    assert classifier.classify(three_js).execution_domain == ExecutionDomain.VENDOR_DEPENDENCY
+    assert classifier.classify(test_file).execution_domain == ExecutionDomain.TEST_MOCK
+
+    # Invariant 3: Scope-Gated Detector Eligibility
+    assert classifier.eligible_for_detector(test_file, "SSRF") is False
+    assert classifier.eligible_for_detector(three_js, "XSS") is False
+    assert classifier.eligible_for_detector(prod_file, "SQLI") is True
+

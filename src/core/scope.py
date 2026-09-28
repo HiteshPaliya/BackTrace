@@ -64,7 +64,16 @@ class ScopeClassifier:
 
         # 1. Vendor Dependency
         is_vendor_dir = any(
-            p in rel_posix for p in ["node_modules/", "vendor/", "site-packages/"]
+            p in rel_posix
+            for p in [
+                "node_modules/",
+                "vendor/",
+                "site-packages/",
+                "assets/private/",
+                "three.js",
+                ".min.js",
+                "dat.gui",
+            ]
         )
         if file_info.is_vendor or is_vendor_dir:
             return ScopeMetadata(
@@ -73,7 +82,7 @@ class ScopeClassifier:
                 environment=Environment.BUILD_TIME,
                 artifact_type=artifact_type,
                 confidence=1.0,
-                evidence="Path matches vendor dependency directory",
+                evidence="Path matches vendor dependency or bundled third-party asset",
             )
 
         # 2. CI/CD Workflows
@@ -155,3 +164,29 @@ class ScopeClassifier:
             confidence=0.92 if role != RuntimeRole.UNKNOWN else 0.75,
             evidence=evidence,
         )
+
+    def eligible_for_detector(self, file_info: FileInfo, detector_type: str) -> bool:
+        """Invariant 3: Scope-gated detector eligibility decisions."""
+        meta = self.classify(file_info)
+        domain = meta.execution_domain
+
+        # Deny production web sinks in test, vendor, generated, and tutorial files
+        denied_domains = {
+            ExecutionDomain.TEST_MOCK,
+            ExecutionDomain.VENDOR_DEPENDENCY,
+            ExecutionDomain.BUILD_OUTPUT_GENERATED,
+            ExecutionDomain.DATA_SEED_TUTORIAL,
+        }
+
+        if domain in denied_domains:
+            return False
+
+        # CI/CD files only eligible for supply-chain detectors
+        if domain == ExecutionDomain.CI_CD_PIPELINE:
+            return detector_type.upper() in ("SUPPLY_CHAIN_CI", "SECRETS")
+
+        # Infrastructure files only eligible for IaC detectors
+        if domain == ExecutionDomain.INFRASTRUCTURE_IAC:
+            return detector_type.upper() in ("INFRASTRUCTURE_CONFIG", "SECRETS")
+
+        return True

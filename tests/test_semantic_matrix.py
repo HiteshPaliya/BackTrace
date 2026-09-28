@@ -54,3 +54,39 @@ def test_template_xss_and_deserialization():
 
     assert any(s.vuln_class == "XSS" for s in pug_findings.sinks)
     assert any(s.vuln_class == "DESERIALIZATION" for s in yaml_findings.sinks)
+
+
+def test_semantic_invariants_reject_literals_and_supertest():
+    """Invariants 1 & 2: Hardcoded literals, Supertest, and JS !== are NEVER sinks."""
+    js_code = """
+        const request = require('supertest');
+        // Supertest call in tests
+        request(app).get('/api/users');
+        // Hardcoded static URL
+        fetch("https://pastebin.com/static_hash");
+        fetch('/rest/admin/application-configuration');
+        // Hardcoded static file path
+        fs.readFileSync('./swagger.yml', 'utf8');
+        // Standard JS comparison operator
+        if (value !== undefined) { doSomething(); }
+    """
+    detector = SemanticDetector()
+    findings = detector.scan_source("app.js", js_code, "javascript")
+
+    assert len(findings.sinks) == 0
+
+
+def test_nosqli_lowercase_collection_and_direct_xxe_import():
+    """Invariants 5 & 6: Lowercase collections and direct XML imports are detected."""
+    js_code = """
+        // Juice Shop trackOrder scenario: lowercase collection name
+        db.ordersCollection.find({ $where: `this.orderId === '${id}'` });
+        // Direct import XML parsing
+        parseXmlString(untrustedData);
+    """
+    detector = SemanticDetector()
+    findings = detector.scan_source("routes/trackOrder.js", js_code, "javascript")
+
+    sink_types = {s.vuln_class for s in findings.sinks}
+    assert "NOSQLI" in sink_types
+    assert "XXE" in sink_types

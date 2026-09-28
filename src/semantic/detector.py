@@ -46,23 +46,31 @@ class SemanticDetector:
     SINK_PATTERNS = [
         # SSRF
         (
-            re.compile(r"""\b(?:needle|axios|urllib\.request)\.(?:get|post|put|delete|head)\s*\([^)]+\)|\bfetch\s*\([^)]+\)|\brequest\s*\([^)]+\)"""),
+            re.compile(
+                r"""\b(?:needle|axios|urllib\.request)\.(?:get|post|put|delete|head)\s*\([^)]+\)"""
+                r"""|\bfetch\s*\([^)]+\)|\brequest\s*\([^)]+\)"""
+            ),
             "SSRF",
             "CRITICAL",
             "CWE-918",
             "HTTP_REQUEST",
         ),
-        # XXE
+        # XXE (Direct import or libxmljs call)
         (
-            re.compile(r"""\blibxmljs\.parseXmlString\s*\([^)]+\)|\bxml2js\.parseString\s*\([^)]+\)|\betree\.fromstring\s*\([^)]+\)"""),
+            re.compile(
+                r"""\b(?:libxmljs\.)?parseXmlString\s*\([^)]+\)"""
+                r"""|\bxml2js\.parseString\s*\([^)]+\)|\betree\.fromstring\s*\([^)]+\)"""
+            ),
             "XXE",
             "CRITICAL",
             "CWE-611",
             "XML_PARSING",
         ),
-        # NoSQL Injection
+        # NoSQL Injection (Any collection/model receiver with query operator)
         (
-            re.compile(r"""\b[A-Z][a-zA-Z0-9_]*\.find(?:One)?\s*\(\s*\{[^}]*\$(?:where|regex)[^}]*\}\s*\)"""),
+            re.compile(
+                r"""\b(?:[a-zA-Z0-9_$]+\.)+find(?:One)?\s*\(\s*\{.*?\$(?:where|regex)"""
+            ),
             "NOSQLI",
             "HIGH",
             "CWE-943",
@@ -70,7 +78,10 @@ class SemanticDetector:
         ),
         # SQL Injection
         (
-            re.compile(r"""\b(?:models\.)?sequelize\.query\s*\([^)]+\)|\bdb\.raw\s*\([^)]+\)|\bcursor\.execute\s*\([^)]+\)"""),
+            re.compile(
+                r"""\b(?:models\.)?sequelize\.query\s*\([^)]+\)|\bdb\.raw\s*\([^)]+\)"""
+                r"""|\bcursor\.execute\s*\([^)]+\)"""
+            ),
             "SQLI",
             "CRITICAL",
             "CWE-89",
@@ -78,7 +89,9 @@ class SemanticDetector:
         ),
         # Path Traversal
         (
-            re.compile(r"""\b(?:res\.sendFile|fs\.readFile|fs\.readFileSync|open)\s*\([^)]+\)"""),
+            re.compile(
+                r"""\b(?:res\.sendFile|fs\.readFile|fs\.readFileSync|open)\s*\([^)]+\)"""
+            ),
             "PATH_TRAVERSAL",
             "HIGH",
             "CWE-22",
@@ -86,7 +99,9 @@ class SemanticDetector:
         ),
         # Command Execution (RCE)
         (
-            re.compile(r"""\b(?:child_process\.exec|os\.system|subprocess\.Popen)\s*\([^)]+\)"""),
+            re.compile(
+                r"""\b(?:child_process\.exec|os\.system|subprocess\.Popen)\s*\([^)]+\)"""
+            ),
             "RCE",
             "CRITICAL",
             "CWE-78",
@@ -94,15 +109,19 @@ class SemanticDetector:
         ),
         # Deserialization
         (
-            re.compile(r"""\byaml\.load\s*\([^)]+\)|\bpickle\.loads\s*\([^)]+\)|\bunserialize\s*\([^)]+\)"""),
+            re.compile(
+                r"""\byaml\.load\s*\([^)]+\)|\bpickle\.loads\s*\([^)]+\)|\bunserialize\s*\([^)]+\)"""
+            ),
             "DESERIALIZATION",
             "HIGH",
             "CWE-502",
             "OBJECT_DESERIALIZATION",
         ),
-        # Template / HTML XSS
+        # Template / DOM XSS
         (
-            re.compile(r"""!=[^\n]+|dangerouslySetInnerHTML|\|\s*safe\b"""),
+            re.compile(
+                r"""!=[^\n]+|\|\s*safe\b|\b(?:dangerouslySetInnerHTML|bypassSecurityTrustHtml|bypassSecurityTrustScript)\b"""
+            ),
             "XSS",
             "HIGH",
             "CWE-79",
@@ -144,13 +163,41 @@ class SemanticDetector:
                         )
                     )
 
-            # 3. Sinks
+            # 3. Sinks with argument & language context evaluation
+            is_template_file = f_str.endswith((".pug", ".jade", ".ejs"))
             for pattern, vuln_class, severity, cwe, context in self.SINK_PATTERNS:
                 for match in pattern.finditer(line_str):
+                    matched_expr = match.group(0)
+
+                    # Invariant 2: Template unescape != is ONLY valid in template files
+                    if matched_expr.startswith("!=") and not is_template_file:
+                        continue
+
+                    # Invariant 1: SSRF must NOT match Supertest or hardcoded string literals
+                    if vuln_class == "SSRF":
+                        if "request(app)" in matched_expr or "request(server)" in matched_expr:
+                            continue
+                        # Check if first argument is a static literal URL
+                        arg_m = re.search(
+                            r"""\(\s*(?:['"]([^'"]+)['"]|`([^`$]+)`)""", matched_expr
+                        )
+                        if arg_m:
+                            literal_val = arg_m.group(1) or arg_m.group(2) or ""
+                            # Fixed domain without variables or relative endpoint is not SSRF
+                            if literal_val.startswith(("/", "http://", "https://")):
+                                continue
+
+                    # Invariant 1: Path Traversal must NOT match hardcoded static paths
+                    if vuln_class == "PATH_TRAVERSAL":
+                        arg_m = re.search(r"""\(\s*['"]([^'"]+)['"]\s*[,)]""", matched_expr)
+                        if arg_m and not re.search(r"""\$\{|\+|path\.join""", matched_expr):
+                            # Hardcoded static file read (e.g. fs.readFileSync('./swagger.yml'))
+                            continue
+
                     findings.sinks.append(
                         SemanticSink(
                             vuln_class=vuln_class,
-                            expression=match.group(0),
+                            expression=matched_expr,
                             triage_severity=severity,
                             line_number=idx,
                             file_path=f_str,
