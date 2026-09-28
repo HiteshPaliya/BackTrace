@@ -313,7 +313,7 @@ CREATE TABLE IF NOT EXISTS candidate_sinks (
     file_id INTEGER NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
     symbol_id INTEGER REFERENCES symbols(symbol_id) ON DELETE SET NULL,
     vuln_class TEXT NOT NULL,
-    severity TEXT CHECK(severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL,
+    triage_severity TEXT CHECK(triage_severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL,
     line_number INTEGER NOT NULL,
     cwe_id TEXT,
     sink_expression TEXT NOT NULL,
@@ -338,9 +338,12 @@ CREATE TABLE IF NOT EXISTS graph_edge_evidence (
     resolution_method TEXT NOT NULL, -- 'FRAMEWORK_RESOLVER', 'DETERMINISTIC_AST', 'SCIP_LSIF', 'HEURISTIC_CALL', 'LINKER_AGENT'
     confidence REAL CHECK(confidence >= 0.0 AND confidence <= 1.0) NOT NULL,
     evidence_json TEXT,
+    indexed_commit TEXT,              -- Tracks commit SHA when evidence was harvested
+    is_active BOOLEAN DEFAULT 1,       -- Invalidation flag when file/symbol changes
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_edge_evidence_edge ON graph_edge_evidence(edge_id);
+CREATE INDEX IF NOT EXISTS idx_edge_evidence_active ON graph_edge_evidence(is_active);
 
 -- ============================================================================
 -- 2. SCAN SESSIONS & VERIFIED FINDINGS LAYER
@@ -383,12 +386,13 @@ CREATE TABLE IF NOT EXISTS scan_candidate_paths (
 CREATE TABLE IF NOT EXISTS scan_dossiers (
     dossier_id TEXT PRIMARY KEY,
     scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
-    finding_fingerprint TEXT NOT NULL, -- Stable across scans: hash(vuln_class, endpoint, source, sink, normalized_path)
+    fingerprint_schema_version INTEGER NOT NULL DEFAULT 1,
+    finding_fingerprint TEXT NOT NULL, -- Stable across scans: SHA256(version + vuln_class + norm_endpoint + norm_source + norm_sink + norm_path)
     path_id TEXT REFERENCES scan_candidate_paths(path_id) ON DELETE SET NULL,
     engine_fingerprint TEXT NOT NULL,
     title TEXT NOT NULL,
     vuln_class TEXT NOT NULL,
-    severity TEXT CHECK(severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL,
+    severity TEXT CHECK(severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL, -- Verified/normalized severity
     cwe_id TEXT,                      -- Nullable: does not force artificial CWE mappings
     verdict TEXT CHECK(verdict IN (
         'EXPLOITABLE', 
@@ -426,6 +430,26 @@ Traversal through the in-memory graph cache uses a composite state key:
 $$\text{TraversalKey} = (\text{node\_id}, \text{edge\_type}, \text{analysis\_state})$$
 where `analysis_state` tracks `(taint_state, auth_context, role_scope)`. This allows legitimate revisiting of utility functions under different taint or principal states while terminating true infinite loops. Hard depth cutoff: **20 hops**.
 
+### 7.4 CPG Invalidation & Incremental Mutation Semantics
+When source files change across incremental scans (`diff` mode), the persistent CPG is mutated rather than rebuilt from zero:
+1. **Modified File (Content/Hash Delta):**
+   - The file's existing `symbols`, `endpoints`, and `candidate_sinks` are marked for replacement or purged (`ON DELETE CASCADE`).
+   - Connected `graph_edge_evidence` records where `caller_symbol_id` or `callee_symbol_id` lived in this file are marked `is_active = 0`.
+   - Dependent `scan_candidate_paths` in active scans traversing invalidated edges are set to state `UNRESOLVED`.
+   - The file is re-indexed by Tree-sitter and Framework Resolvers, creating new symbols and fresh active edge evidence.
+   - Dependent reachability paths are recomputed incrementally.
+2. **Deleted File:**
+   - Deleting the `files` record activates SQLite `ON DELETE CASCADE`, immediately removing its symbols, endpoints, candidate sinks, and connected graph edges.
+   - Any historical `scan_dossiers` referencing affected candidate paths are marked as non-reusable.
+3. **Normalized Finding Fingerprint Formulation:**
+   To guarantee stable vulnerability lifecycle tracking across incremental runs without duplicate alerts:
+   $$\text{finding\_fingerprint} = \text{SHA256}(\text{schema\_version} + \text{vuln\_class} + \text{norm\_endpoint} + \text{norm\_source} + \text{norm\_sink} + \text{norm\_path})$$
+   - `schema_version`: Global integer (currently `1`).
+   - `norm_endpoint`: Standardized HTTP method + normalized path (e.g. `POST /rest/user/login`).
+   - `norm_source`: Qualified parameter token (e.g. `BODY.email`).
+   - `norm_sink`: Canonical sink identifier (e.g. `SQL.models.sequelize.query`).
+   - `norm_path`: Canonical POSIX sequence of qualified symbol identifiers.
+
 ---
 
 ## 8. Evidence-Gated Agentic Verification Pipeline
@@ -461,7 +485,20 @@ where `analysis_state` tracks `(taint_state, auth_context, role_scope)`. This al
                   └── NO  ──> SAFE_PROVEN / INSUFFICIENT_CONTEXT
 ```
 
-### 8.1 Evidence Sufficiency Gate
+### 8.1 Canonical Verdict Definitions
+BackTrace enforces strict semantic boundaries on its four canonical verdicts:
+
+- **`EXPLOITABLE`:**  
+  Attacker control over source input is established, continuous reachability to the sink is proven, the sink's precondition requirements are verified, and intermediate transforms fail to neutralize the payload (a concrete bypass rationale is recorded). Meets all criteria of the Evidence Sufficiency Gate.
+- **`LIKELY_EXPLOITABLE_PARTIAL_SANITIZATION`:**  
+  Reachability and attacker control are established, but a sanitizer, validator, or transform provides incomplete, flawed, or context-dependent protection (e.g. unanchored regex, unquoted parameter, partial blacklist). The available evidence indicates substantial risk but does not justify the stronger deterministic `EXPLOITABLE` verdict.
+- **`SAFE_PROVEN`:**  
+  The analyzed security contract has been demonstrated to hold for the identified source, propagation path, sink, and relevant authorization/context assumptions within the analyzed code/configuration (e.g. strict type coercion, parameterized ORM predicate, verified contextual escaping).  
+  *Operational Boundary:* `SAFE_PROVEN` certifies only that the analyzed flow satisfies its security contract; it **does not** imply the repository is globally vulnerability-free.
+- **`INSUFFICIENT_CONTEXT`:**  
+  The available code slice, dynamic dispatches, unresolvable vendor signatures, or sanitization logic leaves the flow ambiguous or untestable without external assumptions. Prevents hallucinating vulnerabilities when evidence is missing.
+
+### 8.2 Evidence Sufficiency Gate
 A finding receives `EXPLOITABLE` **only** when all required proofs are established:
 1. **Source Control Established:** Attacker role can supply arbitrary or dangerous tokens.
 2. **Reachability Established:** Continuous path exists from entrypoint to sink without broken hops.
