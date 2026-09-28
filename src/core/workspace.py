@@ -120,3 +120,36 @@ class WorkspaceManager:
             )
 
         return discovered
+
+
+class SourceHydrator:
+    """Hydrates source code snippets directly from filesystem when external tools redact them."""
+
+    def __init__(self, root_path: Path | str) -> None:
+        self.root_path = Path(root_path).resolve()
+
+    def hydrate_snippet(
+        self,
+        rel_path: str,
+        line_number: int,
+        tool_snippet: str,
+        context_lines: int = 0,
+    ) -> str:
+        """Resolve actual source line from disk if tool snippet is missing or 'requires login'."""
+        if tool_snippet and tool_snippet.strip().lower() != "requires login":
+            return tool_snippet
+
+        target_file = (self.root_path / rel_path).resolve()
+        if not target_file.is_file():
+            return tool_snippet
+
+        try:
+            lines = target_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            if 1 <= line_number <= len(lines):
+                start = max(0, line_number - 1 - context_lines)
+                end = min(len(lines), line_number + context_lines)
+                return "\n".join(lines[start:end]).strip()
+        except OSError:
+            pass
+
+        return tool_snippet
