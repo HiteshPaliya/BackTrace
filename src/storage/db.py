@@ -482,6 +482,7 @@ class DatabaseManager:
         priority_score: float,
         endpoint_id: Optional[int] = None,
         state: str = "QUEUED",
+        reachability_confidence: float = 1.0,
     ) -> None:
         """Record candidate reachability path for a scan."""
         seq_json = json.dumps(call_sequence)
@@ -490,11 +491,12 @@ class DatabaseManager:
                 """
                 INSERT INTO scan_candidate_paths (
                     path_id, scan_id, endpoint_id, sink_id, hop_count,
-                    call_sequence_json, priority_score, state
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    call_sequence_json, priority_score, reachability_confidence, state
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path_id) DO UPDATE SET
                     state = excluded.state,
                     priority_score = excluded.priority_score,
+                    reachability_confidence = excluded.reachability_confidence,
                     updated_at = CURRENT_TIMESTAMP;
                 """,
                 (
@@ -505,6 +507,7 @@ class DatabaseManager:
                     hop_count,
                     seq_json,
                     priority_score,
+                    reachability_confidence,
                     state,
                 ),
             )
