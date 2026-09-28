@@ -1,6 +1,6 @@
 """In-memory Code Property Graph wrapping NetworkX DiGraph synchronized with SQLite."""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import networkx as nx
 
@@ -20,6 +20,26 @@ class CodePropertyGraph:
     def add_edge(self, u: str, v: str, **attrs: Any) -> None:
         """Add a directed edge between nodes u and v."""
         self.graph.add_edge(u, v, **attrs)
+
+    def add_edge_with_evidence(
+        self,
+        u: str,
+        v: str,
+        edge_type: str,
+        resolution_method: str = "DETERMINISTIC_AST",
+        confidence: float = 1.0,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Add edge with explicit resolution method, evidence, and confidence."""
+        self.graph.add_edge(
+            u,
+            v,
+            edge_type=edge_type,
+            provenance=resolution_method,
+            resolution_method=resolution_method,
+            confidence=float(confidence),
+            evidence=evidence or {},
+        )
 
     def get_node_data(self, node_id: str) -> Dict[str, Any]:
         """Get attributes for node_id."""
