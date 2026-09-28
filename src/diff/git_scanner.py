@@ -27,9 +27,19 @@ class GitDiffEngine:
         self.repo_path = Path(repo_path).resolve()
         self.db = db_manager
 
+    ENGINE_VERSION = "0.2.0"
+    SCHEMA_VERSION = 1
+    RESOLVER_VERSION = "0.2.0"
+
     def compute_engine_fingerprint(self, config: Dict[str, Any]) -> str:
         """Compute deterministic SHA256 engine fingerprint based on config, rules, and models."""
-        canonical_json = json.dumps(config, sort_keys=True)
+        metadata = {
+            "engine_version": self.ENGINE_VERSION,
+            "schema_version": self.SCHEMA_VERSION,
+            "resolver_version": self.RESOLVER_VERSION,
+            **config,
+        }
+        canonical_json = json.dumps(metadata, sort_keys=True)
         return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
 
     def _is_git_repo(self) -> bool:

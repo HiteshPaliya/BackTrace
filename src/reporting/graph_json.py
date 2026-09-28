@@ -1,6 +1,6 @@
 """Graph JSON exporter serializing Code Property Graph into structured JSON format."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.storage.db import DatabaseManager
 
@@ -8,14 +8,24 @@ from src.storage.db import DatabaseManager
 class GraphJSONExporter:
     """Exports persistent repository graph nodes and edges to standard JSON."""
 
-    def export(self, db: DatabaseManager) -> Dict[str, Any]:
-        """Query repository graph from SQLite and return nodes and edges payload."""
+    def export(
+        self,
+        db: DatabaseManager,
+        scope: str = "repository",
+        symbol_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Query repository graph from SQLite with optional scope filtering."""
         nodes: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
 
         with db._get_connection() as conn:
             # Symbols
-            sym_rows = conn.execute("SELECT * FROM symbols;").fetchall()
+            if scope == "symbol" and symbol_name:
+                sym_rows = conn.execute(
+                    "SELECT * FROM symbols WHERE name = ?;", (symbol_name,)
+                ).fetchall()
+            else:
+                sym_rows = conn.execute("SELECT * FROM symbols;").fetchall()
             for r in sym_rows:
                 nodes.append(
                     {
@@ -47,20 +57,32 @@ class GraphJSONExporter:
             # Sinks
             sink_rows = conn.execute("SELECT * FROM candidate_sinks;").fetchall()
             for r in sink_rows:
+                sev = (
+                    r["triage_severity"]
+                    if "triage_severity" in r.keys()
+                    else r["severity"]
+                )
                 nodes.append(
                     {
                         "id": f"sink_{r['sink_id']}",
                         "kind": "SINK",
                         "vuln_class": r["vuln_class"],
-                        "severity": r["severity"],
+                        "severity": sev,
                         "file_id": r["file_id"],
                         "line": r["line_number"],
                         "expression": r["sink_expression"],
                     }
                 )
 
-            # Graph Edges
-            edge_rows = conn.execute("SELECT * FROM graph_edges;").fetchall()
+            # Graph Edges with active evidence
+            query = """
+                SELECT e.*,
+                       COALESCE(ev.resolution_method, 'DETERMINISTIC') as provenance,
+                       COALESCE(ev.confidence, 1.0) as confidence
+                FROM graph_edges e
+                LEFT JOIN graph_edge_evidence ev ON e.edge_id = ev.edge_id AND ev.is_active = 1;
+            """
+            edge_rows = conn.execute(query).fetchall()
             for r in edge_rows:
                 edges.append(
                     {

@@ -1,6 +1,6 @@
 """In-memory Code Property Graph wrapping NetworkX DiGraph synchronized with SQLite."""
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import networkx as nx
 
@@ -20,6 +20,26 @@ class CodePropertyGraph:
     def add_edge(self, u: str, v: str, **attrs: Any) -> None:
         """Add a directed edge between nodes u and v."""
         self.graph.add_edge(u, v, **attrs)
+
+    def add_edge_with_evidence(
+        self,
+        u: str,
+        v: str,
+        edge_type: str,
+        resolution_method: str = "DETERMINISTIC_AST",
+        confidence: float = 1.0,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Add edge with explicit resolution method, evidence, and confidence."""
+        self.graph.add_edge(
+            u,
+            v,
+            edge_type=edge_type,
+            provenance=resolution_method,
+            resolution_method=resolution_method,
+            confidence=float(confidence),
+            evidence=evidence or {},
+        )
 
     def get_node_data(self, node_id: str) -> Dict[str, Any]:
         """Get attributes for node_id."""
@@ -67,11 +87,12 @@ class CodePropertyGraph:
             sink_rows = conn.execute("SELECT * FROM candidate_sinks;").fetchall()
             for r in sink_rows:
                 node_id = f"sink_{r['sink_id']}"
+                sev = r["triage_severity"] if "triage_severity" in r.keys() else r["severity"]
                 self.add_node(
                     node_id,
                     kind="SINK",
                     vuln_class=r["vuln_class"],
-                    severity=r["severity"],
+                    severity=sev,
                     file_id=r["file_id"],
                     line_number=r["line_number"],
                     sink_expr=r["sink_expression"],
@@ -84,8 +105,15 @@ class CodePropertyGraph:
                         confidence=1.0,
                     )
 
-            # 4. Load edges
-            edge_rows = conn.execute("SELECT * FROM graph_edges;").fetchall()
+            # 4. Load edges with active evidence
+            query = """
+                SELECT e.*,
+                       COALESCE(ev.resolution_method, 'DETERMINISTIC') as provenance,
+                       COALESCE(ev.confidence, 1.0) as confidence
+                FROM graph_edges e
+                LEFT JOIN graph_edge_evidence ev ON e.edge_id = ev.edge_id AND ev.is_active = 1;
+            """
+            edge_rows = conn.execute(query).fetchall()
             for r in edge_rows:
                 u = f"sym_{r['caller_symbol_id']}"
                 v = f"sym_{r['callee_symbol_id']}"

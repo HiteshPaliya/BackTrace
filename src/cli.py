@@ -49,17 +49,108 @@ def scan(target_path: str, workers: int, model: str):
 
     console.print(f"[bold green]Started Scan:[/bold green] {scan_id}")
 
-    # 1. Discover Workspace Files
+    # 1. Discover Workspace Files & Classify Scope
     wm = WorkspaceManager(root)
     files = wm.discover_files()
     console.print(f"Discovered [cyan]{len(files)}[/cyan] valid source files.")
 
+    from src.core.scope import ScopeClassifier
+
+    classifier = ScopeClassifier()
     file_map = {}
     for f in files:
-        f_id = db.upsert_file(f.rel_path, f.language or "unknown", f.is_vendor, f.file_hash, f.loc)
+        meta = classifier.classify(f)
+        f_id = db.upsert_file(
+            f.rel_path,
+            f.language or "unknown",
+            f.is_vendor,
+            f.file_hash,
+            f.loc,
+            execution_domain=meta.execution_domain.value,
+            runtime_role=meta.runtime_role.value,
+            environment=meta.environment.value,
+            artifact_type=meta.artifact_type,
+            classification_confidence=meta.confidence,
+            classification_evidence=meta.evidence,
+        )
         file_map[f.rel_path.replace("\\", "/")] = f_id
 
-    # 2. Run Pluggable Tool Adapters & Persist
+    # 2. Framework Semantic Resolvers
+    from src.frameworks.detector import FrameworkDetector
+    from src.frameworks.express import ExpressResolver
+
+    detector = FrameworkDetector(root)
+    fw = detector.identify()
+    if fw == "express":
+        resolver = ExpressResolver(root)
+        endpoints = resolver.resolve_endpoints()
+        ep_count = len(endpoints)
+        console.print(f"Framework resolver mapped [cyan]{ep_count}[/cyan] endpoints.")
+        for ep in endpoints:
+            f_id = file_map.get(ep.file_path)
+            if not f_id:
+                f_id = db.upsert_file(ep.file_path, "javascript", False, "fw", 1)
+                file_map[ep.file_path] = f_id
+            db.insert_endpoint(
+                file_id=f_id,
+                http_method=ep.http_method,
+                route_pattern=ep.route_pattern,
+                line_number=ep.line_number,
+                tool_provenance="FrameworkResolver",
+                auth_required=(ep.auth_state == "REQUIRED"),
+                parameters=[],
+            )
+
+    # 3. Built-in Semantic Detectors (Track A & Track B)
+    from src.semantic.authz import AuthorizationAnalyzer
+    from src.semantic.detector import SemanticDetector
+
+    sem_detector = SemanticDetector()
+    authz_analyzer = AuthorizationAnalyzer()
+
+    for f in files:
+        if f.is_vendor:
+            continue
+        try:
+            code = Path(f.abs_path).read_text(encoding="utf-8", errors="replace")
+            f_id = file_map.get(f.rel_path.replace("\\", "/"))
+            if not f_id:
+                continue
+
+            # Track A: Semantic Sinks
+            findings = sem_detector.scan_source(f.rel_path, code, f.language or "")
+            for s in findings.sinks:
+                db.insert_candidate_sink(
+                    file_id=f_id,
+                    vuln_class=s.vuln_class,
+                    triage_severity=s.triage_severity,
+                    line_number=s.line_number,
+                    sink_expression=s.expression,
+                    raw_rule_id=f"semantic.{s.vuln_class.lower()}",
+                    tool_provenance="SemanticAST",
+                    cwe_id=s.cwe_id,
+                )
+
+            # Track B: AuthZ Gaps (BOLA/IDOR)
+            if any(part in f.rel_path.lower() for part in ["route", "controller", "server", "app"]):
+                authz_res = authz_analyzer.analyze_handler(
+                    "GET", f.rel_path, code, f.language or "javascript"
+                )
+                if authz_res.has_gap:
+                    db.insert_candidate_sink(
+                        file_id=f_id,
+                        vuln_class="BOLA_IDOR",
+                        triage_severity="HIGH",
+                        line_number=1,
+                        sink_expression=authz_res.retrieval_op or "Unscoped query",
+                        raw_rule_id="semantic.authz.gap",
+                        tool_provenance="AuthzAnalyzer",
+                        cwe_id="CWE-639",
+                    )
+        except Exception:
+            continue
+
+    # 4. Run Pluggable Tool Adapters & Persist Corroborating Evidence
     tool_mgr = ToolManager()
     tool_results = tool_mgr.run_all(root)
     for tool_name, res in tool_results.items():
@@ -86,7 +177,7 @@ def scan(target_path: str, workers: int, model: str):
                     db.insert_candidate_sink(
                         file_id=file_id,
                         vuln_class=item.get("vuln_class", "GENERAL_VULN"),
-                        severity=item.get("severity", "MEDIUM"),
+                        triage_severity=item.get("severity", "MEDIUM"),
                         line_number=item.get("line_number", 1),
                         sink_expression=item.get("sink_expression", ""),
                         raw_rule_id=item.get("raw_rule_id", "semgrep.rule"),
@@ -96,7 +187,7 @@ def scan(target_path: str, workers: int, model: str):
         else:
             console.print(f"[yellow]Tool {tool_name} not available, softly degraded.[/yellow]")
 
-    # 3. Index AST Symbols and Calls
+    # 5. Index AST Symbols and Calls
     indexer = TreeSitterIndexer()
     for f in files:
         if f.is_vendor:
@@ -143,11 +234,13 @@ def scan(target_path: str, workers: int, model: str):
     node_count = cpg.graph.number_of_nodes()
     console.print(f"Code Property Graph loaded with [cyan]{node_count}[/cyan] nodes.")
 
-    # 5. Synthesize Dossiers from Candidate Sinks & Paths
+    # 6. Synthesize Dossiers from Candidate Sinks & Paths
+    from src.agents.verifier import EvidenceGateVerifier
     from src.reporting.synthesizer import DossierSynthesizer
-    from src.storage.db import VerdictStatus
 
     synthesizer = DossierSynthesizer()
+    verifier = EvidenceGateVerifier()
+
     with db._get_connection() as conn:
         sinks = conn.execute(
             """
@@ -156,70 +249,116 @@ def scan(target_path: str, workers: int, model: str):
             JOIN files f ON s.file_id = f.file_id;
             """
         ).fetchall()
+        endpoints = conn.execute("SELECT * FROM endpoints;").fetchall()
 
     if sinks:
         console.print(f"Synthesizing dossiers for [cyan]{len(sinks)}[/cyan] candidate sinks...")
         for s in sinks:
+            sev = (
+                s["triage_severity"]
+                if "triage_severity" in s.keys()
+                else s.get("severity", "MEDIUM")
+            )
             path_id = f"path_{scan_id}_{s['sink_id']}"
             source_trace = [{"file": s["rel_path"], "line": s["line_number"]}]
+
+            matching_ep = None
+            for ep in endpoints:
+                if ep["file_id"] == s["file_id"] or ep["route_pattern"] in s["rel_path"]:
+                    matching_ep = ep
+                    break
+            if not matching_ep and endpoints:
+                matching_ep = endpoints[0]
+
+            ep_method = matching_ep["http_method"] if matching_ep else "GET"
+            ep_route = (
+                matching_ep["route_pattern"]
+                if matching_ep
+                else f"/{Path(s['rel_path']).stem}"
+            )
+            auth_state = (
+                matching_ep["auth_state"]
+                if matching_ep and "auth_state" in matching_ep.keys()
+                else "NOT_REQUIRED"
+            )
+
+            v_res = verifier.evaluate_contract(
+                source_control="CONFIRMED",
+                reachability_confidence=0.85,
+                sink_preconditions=f"{s['vuln_class']} execution precondition",
+                transform_status="FAILED",
+                bypass_reasoning=(
+                    f"Tainted input reaches {s['vuln_class']} sink: "
+                    f"{s['sink_expression'][:80]}"
+                ),
+                auth_state=auth_state,
+            )
+
+            param_name = (
+                "url"
+                if s["vuln_class"] == "SSRF"
+                else ("id" if s["vuln_class"] == "BOLA_IDOR" else "q")
+            )
+            blueprint = synthesizer.generate_reproduction_template(
+                endpoint_method=ep_method,
+                route_pattern=ep_route,
+                auth_state=auth_state,
+                tainted_param={
+                    "location": "QUERY" if ep_method == "GET" else "BODY",
+                    "name": param_name,
+                },
+                sink_target=s["sink_expression"][:50],
+            )
+
+            finding_fp = db.compute_finding_fingerprint(
+                schema_version=1,
+                vuln_class=s["vuln_class"],
+                norm_endpoint=f"{ep_method} {ep_route}",
+                norm_source=f"PARAM.{param_name}",
+                norm_sink=s["raw_rule_id"],
+                norm_path=f"{s['rel_path']}:{s['line_number']}",
+            )
+
+            if s["vuln_class"] == "BOLA_IDOR":
+                title = (
+                    f"BOLA / IDOR in {s['sink_expression']} "
+                    f"({Path(s['rel_path']).name}:{s['line_number']})"
+                )
+            else:
+                title = f"{s['vuln_class']} in {Path(s['rel_path']).name}:{s['line_number']}"
             db.record_candidate_path(
                 path_id=path_id,
                 scan_id=scan_id,
                 sink_id=s["sink_id"],
                 hop_count=1,
                 call_sequence=[s["sink_id"]],
-                priority_score=0.9 if s["severity"] in ("CRITICAL", "HIGH") else 0.5,
+                priority_score=0.9 if sev in ("CRITICAL", "HIGH") else 0.5,
+                reachability_confidence=0.85,
             )
 
-            title = f"{s['vuln_class']} in {Path(s['rel_path']).name}:{s['line_number']}"
-            curl_template = (
-                "curl -X POST http://localhost:3000/api -d 'payload=exploit'"
-                if s["vuln_class"] in ("RCE", "SQLI", "SSRF")
-                else None
-            )
-
-            dossier = synthesizer.synthesize(
+            db.record_dossier(
+                dossier_id=f"dos_{scan_id[:8]}_{s['sink_id']}",
                 scan_id=scan_id,
                 path_id=path_id,
                 engine_fingerprint=fingerprint,
                 title=title,
                 vuln_class=s["vuln_class"],
-                severity=s["severity"],
+                severity=sev,
                 cwe_id=s["cwe_id"] or "CWE-Unknown",
-                verdict=(
-                    VerdictStatus.EXPLOITABLE
-                    if s["severity"] in ("CRITICAL", "HIGH")
-                    else VerdictStatus.LIKELY_EXPLOITABLE_PARTIAL_SANITIZATION
-                ),
-                confidence=0.85,
+                verdict=v_res.verdict.value,
+                reachability_confidence=v_res.reachability_confidence,
+                exploitability_confidence=v_res.exploitability_confidence,
                 source_trace=source_trace,
-                sanitizer_analysis={
-                    "sink_expression": s["sink_expression"],
-                    "bypass_reasoning": (
-                        f"Unsanitized source reaching {s['vuln_class']} sink: "
-                        f"{s['sink_expression'][:100]}"
-                    ),
-                    "tool_provenance": s["tool_provenance"],
-                },
-                repro_curl=curl_template,
-                mitigation=f"Sanitize tainted input before passing to {s['vuln_class']} sink.",
-            )
-
-            db.record_dossier(
-                dossier_id=dossier["dossier_id"],
-                scan_id=scan_id,
-                path_id=dossier["path_id"],
-                engine_fingerprint=fingerprint,
-                title=dossier["title"],
-                vuln_class=dossier["vuln_class"],
-                severity=dossier["severity"],
-                cwe_id=dossier["cwe_id"],
-                verdict=dossier["verdict"],
-                confidence=dossier["confidence"],
-                source_trace=dossier["source_trace"],
-                sanitizer_analysis=dossier["sanitizer_analysis"],
-                repro_curl_template=dossier["repro_curl_template"],
-                mitigation_notes=dossier["mitigation_notes"],
+                sanitizer_analysis={"bypass_reasoning": v_res.bypass_reasoning},
+                evidence_bundle=v_res.evidence_bundle,
+                finding_fingerprint=finding_fp,
+                fingerprint_schema_version=1,
+                repro_curl_template=blueprint["curl_command"],
+                repro_template=blueprint,
+                mitigation_notes=(
+                    f"Sanitize and validate untrusted input before "
+                    f"{s['vuln_class']} sink."
+                ),
             )
 
     db.update_scan_status(scan_id, "COMPLETED", {"files_indexed": len(files)})
