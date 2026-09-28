@@ -1,6 +1,6 @@
 """Graph JSON exporter serializing Code Property Graph into structured JSON format."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from src.storage.db import DatabaseManager
 
@@ -8,14 +8,24 @@ from src.storage.db import DatabaseManager
 class GraphJSONExporter:
     """Exports persistent repository graph nodes and edges to standard JSON."""
 
-    def export(self, db: DatabaseManager) -> Dict[str, Any]:
-        """Query repository graph from SQLite and return nodes and edges payload."""
+    def export(
+        self,
+        db: DatabaseManager,
+        scope: str = "repository",
+        symbol_name: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Query repository graph from SQLite with optional scope filtering."""
         nodes: List[Dict[str, Any]] = []
         edges: List[Dict[str, Any]] = []
 
         with db._get_connection() as conn:
             # Symbols
-            sym_rows = conn.execute("SELECT * FROM symbols;").fetchall()
+            if scope == "symbol" and symbol_name:
+                sym_rows = conn.execute(
+                    "SELECT * FROM symbols WHERE name = ?;", (symbol_name,)
+                ).fetchall()
+            else:
+                sym_rows = conn.execute("SELECT * FROM symbols;").fetchall()
             for r in sym_rows:
                 nodes.append(
                     {
