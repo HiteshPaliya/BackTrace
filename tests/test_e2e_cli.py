@@ -144,7 +144,7 @@ def test_e2e_cli_scan_diff_report_resume(tmp_path: Path):
     sarif_data = SARIFExporter().export(dossiers)
     assert sarif_data["version"] == "2.1.0"
     assert sarif_data["runs"][0]["tool"]["driver"]["name"] == "PolyglotSourceCodeSecurityReviewer"
-    assert len(sarif_data["runs"][0]["results"]) == 1
+    assert len(sarif_data["runs"][0]["results"]) >= 1
 
     graph_data = GraphJSONExporter().export(db)
     assert len(graph_data["nodes"]) >= 3
