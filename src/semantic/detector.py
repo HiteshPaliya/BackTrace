@@ -174,25 +174,31 @@ class SemanticDetector:
                         continue
 
                     # Invariant 1: SSRF must NOT match Supertest or hardcoded string literals
+                    arg_expr = None
                     if vuln_class == "SSRF":
                         if "request(app)" in matched_expr or "request(server)" in matched_expr:
                             continue
-                        # Check if first argument is a static literal URL
-                        arg_m = re.search(
-                            r"""\(\s*(?:['"]([^'"]+)['"]|`([^`$]+)`)""", matched_expr
-                        )
-                        if arg_m:
-                            literal_val = arg_m.group(1) or arg_m.group(2) or ""
-                            # Fixed domain without variables or relative endpoint is not SSRF
-                            if literal_val.startswith(("/", "http://", "https://")):
+                        arg_match = re.search(r"""\(\s*([^,)]+)""", matched_expr)
+                        if arg_match:
+                            arg_expr = arg_match.group(1).strip()
+                            is_lit = (
+                                (arg_expr.startswith(("'", '"')) and arg_expr.endswith(("'", '"')))
+                                or (arg_expr.startswith("`") and "${" not in arg_expr)
+                            )
+                            if is_lit:
                                 continue
 
                     # Invariant 1: Path Traversal must NOT match hardcoded static paths
                     if vuln_class == "PATH_TRAVERSAL":
-                        arg_m = re.search(r"""\(\s*['"]([^'"]+)['"]\s*[,)]""", matched_expr)
-                        if arg_m and not re.search(r"""\$\{|\+|path\.join""", matched_expr):
-                            # Hardcoded static file read (e.g. fs.readFileSync('./swagger.yml'))
-                            continue
+                        arg_match = re.search(r"""\(\s*([^,)]+)""", matched_expr)
+                        if arg_match:
+                            arg_expr = arg_match.group(1).strip()
+                            is_lit = (
+                                (arg_expr.startswith(("'", '"')) and arg_expr.endswith(("'", '"')))
+                                or (arg_expr.startswith("`") and "${" not in arg_expr)
+                            )
+                            if is_lit and not re.search(r"""\$\{|\+|path\.join""", matched_expr):
+                                continue
 
                     findings.sinks.append(
                         SemanticSink(
@@ -203,6 +209,8 @@ class SemanticDetector:
                             file_path=f_str,
                             cwe_id=cwe,
                             sink_context=context,
+                            argument_expression=arg_expr,
+                            is_variable_argument=True,
                         )
                     )
 

@@ -12,6 +12,7 @@ from src.adapters.manager import ToolManager
 from src.core.workspace import WorkspaceManager
 from src.diff.git_scanner import GitDiffEngine
 from src.graph.cpg import CodePropertyGraph
+from src.graph.reachability import ReachabilityAnalyzer
 from src.indexer.treesitter import TreeSitterIndexer
 from src.reporting.graph_json import GraphJSONExporter
 from src.reporting.markdown import MarkdownExporter
@@ -167,6 +168,14 @@ def scan(target_path: str, workers: int, model: str):
                     file_id = db.upsert_file(rel, "unknown", False, "unknown", 1)
                     file_map[rel] = file_id
 
+                f_obj = next(
+                    (f for f in files if f.rel_path.replace("\\", "/") == rel), None
+                )
+                if f_obj and not classifier.eligible_for_detector(
+                    f_obj, item.get("vuln_class", "")
+                ):
+                    continue
+
                 if tool_name == "noir":
                     db.insert_endpoint(
                         file_id=file_id,
@@ -239,11 +248,12 @@ def scan(target_path: str, workers: int, model: str):
     console.print(f"Code Property Graph loaded with [cyan]{node_count}[/cyan] nodes.")
 
     # 6. Synthesize Dossiers from Candidate Sinks & Paths
-    from src.agents.verifier import EvidenceGateVerifier
+    from src.agents.verifier import EvidenceBundle, EvidenceGateVerifier
     from src.reporting.synthesizer import DossierSynthesizer
 
     synthesizer = DossierSynthesizer()
     verifier = EvidenceGateVerifier()
+    reachability_analyzer = ReachabilityAnalyzer(cpg)
 
     with db._get_connection() as conn:
         sinks = conn.execute(
@@ -267,12 +277,24 @@ def scan(target_path: str, workers: int, model: str):
             source_trace = [{"file": s["rel_path"], "line": s["line_number"]}]
 
             matching_ep = None
+            proven_path = None
+            sink_cpg_id = f"sink_{s['sink_id']}"
+
+            # Invariant 4: Proof-based endpoint reachability via CPG
             for ep in endpoints:
-                if ep["file_id"] == s["file_id"] or ep["route_pattern"] in s["rel_path"]:
+                ep_cpg_id = f"ep_{ep['endpoint_id']}"
+                found_paths = reachability_analyzer.find_paths(
+                    ep_cpg_id, sink_cpg_id, max_hops=20
+                )
+                if found_paths:
+                    matching_ep = ep
+                    proven_path = found_paths[0]
+                    break
+                if ep["file_id"] == s["file_id"]:
                     matching_ep = ep
                     break
 
-            # Invariant 4: No arbitrary endpoints[0] fallback!
+            # Invariant 7: Evidence-gated verifier bundle
             if matching_ep:
                 ep_method = matching_ep["http_method"]
                 ep_route = matching_ep["route_pattern"]
@@ -281,50 +303,74 @@ def scan(target_path: str, workers: int, model: str):
                     if "auth_state" in matching_ep.keys()
                     else "NOT_REQUIRED"
                 )
-                source_control = "CONFIRMED"
-                reach_conf = 0.85
-                transform_status = "FAILED"
+                reach_conf = proven_path.reachability_confidence if proven_path else 0.85
+                ev_bundle = EvidenceBundle(
+                    source_node={"method": ep_method, "route": ep_route},
+                    path_trace=proven_path.nodes if proven_path else source_trace,
+                    sink_node={
+                        "vuln_class": s["vuln_class"],
+                        "expression": s["sink_expression"],
+                    },
+                    auth_state=auth_state,
+                    reachability_confidence=reach_conf,
+                    bypass_reasoning=(
+                        f"Tainted input reaches {s['vuln_class']} sink: "
+                        f"{s['sink_expression'][:80]}"
+                    ),
+                )
             else:
                 ep_method = None
                 ep_route = None
                 auth_state = "UNKNOWN"
-                source_control = "UNKNOWN"
-                reach_conf = 0.40
-                transform_status = "UNKNOWN"
+                reach_conf = 0.0
+                ev_bundle = EvidenceBundle(
+                    source_node=None,
+                    path_trace=None,
+                    sink_node={
+                        "vuln_class": s["vuln_class"],
+                        "expression": s["sink_expression"],
+                    },
+                    auth_state="UNKNOWN",
+                    reachability_confidence=0.0,
+                    bypass_reasoning="No CPG reachability path proven from route to sink",
+                )
 
-            v_res = verifier.evaluate_contract(
-                source_control=source_control,
-                reachability_confidence=reach_conf,
-                sink_preconditions=f"{s['vuln_class']} execution precondition",
-                transform_status=transform_status,
-                bypass_reasoning=(
-                    f"Tainted input reaches {s['vuln_class']} sink: "
-                    f"{s['sink_expression'][:80]}"
-                ),
-                auth_state=auth_state,
-            )
+            v_res = verifier.evaluate_contract(evidence_bundle=ev_bundle)
 
-            param_name = (
-                "url"
-                if s["vuln_class"] == "SSRF"
-                else ("id" if s["vuln_class"] == "BOLA_IDOR" else "q")
-            )
-            blueprint = synthesizer.generate_reproduction_template(
-                endpoint_method=ep_method,
-                route_pattern=ep_route,
-                auth_state=auth_state,
-                tainted_param={
-                    "location": "QUERY" if ep_method == "GET" else "BODY",
-                    "name": param_name,
-                },
-                sink_target=s["sink_expression"][:50],
-            )
+            # Invariant 4 & Invariant 8: Non-weaponized blueprint or NONE
+            if matching_ep:
+                param_name = (
+                    "url"
+                    if s["vuln_class"] == "SSRF"
+                    else ("id" if s["vuln_class"] == "BOLA_IDOR" else "q")
+                )
+                blueprint = synthesizer.generate_reproduction_template(
+                    endpoint_method=ep_method,
+                    route_pattern=ep_route,
+                    auth_state=auth_state,
+                    tainted_param={
+                        "location": "QUERY" if ep_method == "GET" else "BODY",
+                        "name": param_name,
+                    },
+                    sink_target=s["sink_expression"][:50],
+                )
+                repro_curl = blueprint["curl_command"]
+            else:
+                blueprint = {
+                    "reproduction_type": "NONE",
+                    "expected_assertion": {
+                        "assertion_type": "INTERNAL_UNEXPOSED_SINK",
+                        "description": "Internal sink with no proven external HTTP route",
+                    },
+                }
+                repro_curl = None
 
+            norm_ep_str = f"{ep_method} {ep_route}" if ep_method else "N/A"
             finding_fp = db.compute_finding_fingerprint(
                 schema_version=1,
                 vuln_class=s["vuln_class"],
-                norm_endpoint=f"{ep_method} {ep_route}",
-                norm_source=f"PARAM.{param_name}",
+                norm_endpoint=norm_ep_str,
+                norm_source="req.input" if matching_ep else "internal",
                 norm_sink=s["raw_rule_id"],
                 norm_path=f"{s['rel_path']}:{s['line_number']}",
             )
@@ -343,7 +389,7 @@ def scan(target_path: str, workers: int, model: str):
                 hop_count=1,
                 call_sequence=[s["sink_id"]],
                 priority_score=0.9 if sev in ("CRITICAL", "HIGH") else 0.5,
-                reachability_confidence=0.85,
+                reachability_confidence=reach_conf,
             )
 
             db.record_dossier(
@@ -358,12 +404,13 @@ def scan(target_path: str, workers: int, model: str):
                 verdict=v_res.verdict.value,
                 reachability_confidence=v_res.reachability_confidence,
                 exploitability_confidence=v_res.exploitability_confidence,
+                confidence=v_res.confidence,
                 source_trace=source_trace,
                 sanitizer_analysis={"bypass_reasoning": v_res.bypass_reasoning},
                 evidence_bundle=v_res.evidence_bundle,
                 finding_fingerprint=finding_fp,
                 fingerprint_schema_version=1,
-                repro_curl_template=blueprint["curl_command"],
+                repro_curl_template=repro_curl,
                 repro_template=blueprint,
                 mitigation_notes=(
                     f"Sanitize and validate untrusted input before "

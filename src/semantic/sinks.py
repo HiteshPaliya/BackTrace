@@ -15,3 +15,7 @@ class SemanticSink:
     file_path: str
     cwe_id: Optional[str] = None
     sink_context: Optional[str] = None
+    argument_expression: Optional[str] = None
+    is_variable_argument: bool = True
+    sink_api: Optional[str] = None
+    scope: str = "APPLICATION_RUNTIME"
