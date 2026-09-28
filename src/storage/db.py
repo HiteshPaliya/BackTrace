@@ -47,10 +47,113 @@ class DatabaseManager:
             conn.close()
 
     def init_schema(self) -> None:
-        """Initialize database tables and indexes from schema.sql."""
+        """Initialize or migrate database tables and indexes from schema.sql."""
         schema_path = Path(__file__).parent / "schema.sql"
         schema_sql = schema_path.read_text(encoding="utf-8")
         with self._get_connection() as conn:
+            # Check if files table exists and needs column migrations
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='files';"
+            )
+            if cursor.fetchone():
+                cols = [row[1] for row in conn.execute("PRAGMA table_info(files);").fetchall()]
+                if "execution_domain" not in cols:
+                    conn.execute(
+                        "ALTER TABLE files ADD COLUMN execution_domain TEXT "
+                        "DEFAULT 'APPLICATION_RUNTIME';"
+                    )
+                if "runtime_role" not in cols:
+                    conn.execute(
+                        "ALTER TABLE files ADD COLUMN runtime_role TEXT DEFAULT 'UNKNOWN';"
+                    )
+                if "environment" not in cols:
+                    conn.execute(
+                        "ALTER TABLE files ADD COLUMN environment TEXT DEFAULT 'PRODUCTION';"
+                    )
+                if "artifact_type" not in cols:
+                    conn.execute(
+                        "ALTER TABLE files ADD COLUMN artifact_type TEXT DEFAULT 'UNKNOWN';"
+                    )
+                if "classification_confidence" not in cols:
+                    conn.execute(
+                        "ALTER TABLE files ADD COLUMN classification_confidence REAL "
+                        "DEFAULT 0.8;"
+                    )
+                if "classification_evidence" not in cols:
+                    conn.execute(
+                        "ALTER TABLE files ADD COLUMN classification_evidence TEXT;"
+                    )
+
+            # Check candidate_sinks for triage_severity
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='candidate_sinks';"
+            )
+            if cursor.fetchone():
+                cols = [
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(candidate_sinks);").fetchall()
+                ]
+                if "triage_severity" not in cols:
+                    conn.execute(
+                        "ALTER TABLE candidate_sinks ADD COLUMN triage_severity TEXT "
+                        "DEFAULT 'MEDIUM';"
+                    )
+
+            # Check scan_candidate_paths for reachability_confidence
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND "
+                "name='scan_candidate_paths';"
+            )
+            if cursor.fetchone():
+                cols = [
+                    row[1]
+                    for row in conn.execute(
+                        "PRAGMA table_info(scan_candidate_paths);"
+                    ).fetchall()
+                ]
+                if "reachability_confidence" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_candidate_paths ADD COLUMN "
+                        "reachability_confidence REAL DEFAULT 1.0;"
+                    )
+
+            # Check scan_dossiers for new columns
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='scan_dossiers';"
+            )
+            if cursor.fetchone():
+                cols = [
+                    row[1]
+                    for row in conn.execute("PRAGMA table_info(scan_dossiers);").fetchall()
+                ]
+                if "fingerprint_schema_version" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_dossiers ADD COLUMN fingerprint_schema_version "
+                        "INTEGER DEFAULT 1;"
+                    )
+                if "finding_fingerprint" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_dossiers ADD COLUMN finding_fingerprint TEXT;"
+                    )
+                if "reachability_confidence" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_dossiers ADD COLUMN reachability_confidence REAL "
+                        "DEFAULT 1.0;"
+                    )
+                if "exploitability_confidence" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_dossiers ADD COLUMN exploitability_confidence REAL "
+                        "DEFAULT 0.85;"
+                    )
+                if "evidence_bundle_json" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_dossiers ADD COLUMN evidence_bundle_json TEXT;"
+                    )
+                if "repro_template_json" not in cols:
+                    conn.execute(
+                        "ALTER TABLE scan_dossiers ADD COLUMN repro_template_json TEXT;"
+                    )
+
             conn.executescript(schema_sql)
 
     # =========================================================================
