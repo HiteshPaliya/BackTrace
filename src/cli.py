@@ -160,6 +160,11 @@ def scan(target_path: str, workers: int, model: str):
     if sinks:
         console.print(f"Synthesizing dossiers for [cyan]{len(sinks)}[/cyan] candidate sinks...")
         for s in sinks:
+            sev = (
+                s["triage_severity"]
+                if "triage_severity" in s.keys()
+                else s.get("severity", "MEDIUM")
+            )
             path_id = f"path_{scan_id}_{s['sink_id']}"
             source_trace = [{"file": s["rel_path"], "line": s["line_number"]}]
             db.record_candidate_path(
@@ -168,7 +173,7 @@ def scan(target_path: str, workers: int, model: str):
                 sink_id=s["sink_id"],
                 hop_count=1,
                 call_sequence=[s["sink_id"]],
-                priority_score=0.9 if s["severity"] in ("CRITICAL", "HIGH") else 0.5,
+                priority_score=0.9 if sev in ("CRITICAL", "HIGH") else 0.5,
             )
 
             title = f"{s['vuln_class']} in {Path(s['rel_path']).name}:{s['line_number']}"
@@ -184,11 +189,11 @@ def scan(target_path: str, workers: int, model: str):
                 engine_fingerprint=fingerprint,
                 title=title,
                 vuln_class=s["vuln_class"],
-                severity=s["severity"],
+                severity=sev,
                 cwe_id=s["cwe_id"] or "CWE-Unknown",
                 verdict=(
                     VerdictStatus.EXPLOITABLE
-                    if s["severity"] in ("CRITICAL", "HIGH")
+                    if sev in ("CRITICAL", "HIGH")
                     else VerdictStatus.LIKELY_EXPLOITABLE_PARTIAL_SANITIZATION
                 ),
                 confidence=0.85,

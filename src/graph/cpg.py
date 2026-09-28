@@ -67,11 +67,12 @@ class CodePropertyGraph:
             sink_rows = conn.execute("SELECT * FROM candidate_sinks;").fetchall()
             for r in sink_rows:
                 node_id = f"sink_{r['sink_id']}"
+                sev = r["triage_severity"] if "triage_severity" in r.keys() else r["severity"]
                 self.add_node(
                     node_id,
                     kind="SINK",
                     vuln_class=r["vuln_class"],
-                    severity=r["severity"],
+                    severity=sev,
                     file_id=r["file_id"],
                     line_number=r["line_number"],
                     sink_expr=r["sink_expression"],
@@ -84,8 +85,15 @@ class CodePropertyGraph:
                         confidence=1.0,
                     )
 
-            # 4. Load edges
-            edge_rows = conn.execute("SELECT * FROM graph_edges;").fetchall()
+            # 4. Load edges with active evidence
+            query = """
+                SELECT e.*,
+                       COALESCE(ev.resolution_method, 'DETERMINISTIC') as provenance,
+                       COALESCE(ev.confidence, 1.0) as confidence
+                FROM graph_edges e
+                LEFT JOIN graph_edge_evidence ev ON e.edge_id = ev.edge_id AND ev.is_active = 1;
+            """
+            edge_rows = conn.execute(query).fetchall()
             for r in edge_rows:
                 u = f"sym_{r['caller_symbol_id']}"
                 v = f"sym_{r['callee_symbol_id']}"

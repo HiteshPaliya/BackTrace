@@ -1,5 +1,6 @@
 """SQLite DatabaseManager implementing decoupled repository graph and scan state store."""
 
+import hashlib
 import json
 import sqlite3
 import uuid
@@ -64,25 +65,52 @@ class DatabaseManager:
         file_hash: str,
         loc: int,
         last_indexed_commit: Optional[str] = None,
+        execution_domain: str = "APPLICATION_RUNTIME",
+        runtime_role: str = "UNKNOWN",
+        environment: str = "PRODUCTION",
+        artifact_type: str = "UNKNOWN",
+        classification_confidence: float = 0.8,
+        classification_evidence: Optional[str] = None,
     ) -> int:
-        """Insert or update a repository file record."""
+        """Insert or update a repository file record with scope metadata."""
         with self.transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO files (
-                    rel_path, language, is_vendor, file_hash, loc, last_indexed_commit
+                    rel_path, language, is_vendor, file_hash, loc, last_indexed_commit,
+                    execution_domain, runtime_role, environment, artifact_type,
+                    classification_confidence, classification_evidence
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(rel_path) DO UPDATE SET
                     language = excluded.language,
                     is_vendor = excluded.is_vendor,
                     file_hash = excluded.file_hash,
                     loc = excluded.loc,
                     last_indexed_commit = excluded.last_indexed_commit,
+                    execution_domain = excluded.execution_domain,
+                    runtime_role = excluded.runtime_role,
+                    environment = excluded.environment,
+                    artifact_type = excluded.artifact_type,
+                    classification_confidence = excluded.classification_confidence,
+                    classification_evidence = excluded.classification_evidence,
                     last_indexed_at = CURRENT_TIMESTAMP
                 RETURNING file_id;
                 """,
-                (rel_path, language, int(is_vendor), file_hash, loc, last_indexed_commit),
+                (
+                    rel_path,
+                    language,
+                    int(is_vendor),
+                    file_hash,
+                    loc,
+                    last_indexed_commit,
+                    execution_domain,
+                    runtime_role,
+                    environment,
+                    artifact_type,
+                    classification_confidence,
+                    classification_evidence,
+                ),
             )
             row = cursor.fetchone()
             return int(row["file_id"])
@@ -179,25 +207,27 @@ class DatabaseManager:
         self,
         file_id: int,
         vuln_class: str,
-        severity: str,
-        line_number: int,
-        sink_expression: str,
-        raw_rule_id: str,
-        tool_provenance: str,
+        triage_severity: Optional[str] = None,
+        line_number: int = 1,
+        sink_expression: str = "",
+        raw_rule_id: str = "",
+        tool_provenance: str = "",
+        severity: Optional[str] = None,
         symbol_id: Optional[int] = None,
         cwe_id: Optional[str] = None,
     ) -> int:
-        """Insert a discovered candidate vulnerability sink."""
+        """Insert a discovered candidate vulnerability sink with triage severity."""
+        eff_severity = (triage_severity or severity or "MEDIUM").upper()
         with self.transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO candidate_sinks (
-                    file_id, symbol_id, vuln_class, severity, line_number,
+                    file_id, symbol_id, vuln_class, triage_severity, line_number,
                     cwe_id, sink_expression, raw_rule_id, tool_provenance
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(file_id, line_number, raw_rule_id) DO UPDATE SET
                     vuln_class = excluded.vuln_class,
-                    severity = excluded.severity,
+                    triage_severity = excluded.triage_severity,
                     sink_expression = excluded.sink_expression,
                     tool_provenance = excluded.tool_provenance
                 RETURNING sink_id;
@@ -206,7 +236,7 @@ class DatabaseManager:
                     file_id,
                     symbol_id,
                     vuln_class,
-                    severity,
+                    eff_severity,
                     line_number,
                     cwe_id,
                     sink_expression,
@@ -222,42 +252,131 @@ class DatabaseManager:
         caller_symbol_id: int,
         callee_symbol_id: int,
         edge_type: str,
-        provenance: str,
-        confidence: float,
+        provenance: Optional[str] = None,
+        confidence: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> int:
-        """Insert a cross-symbol graph edge."""
-        meta_json = json.dumps(metadata or {})
+        """Insert or retrieve logical cross-symbol graph edge."""
         with self.transaction() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO graph_edges (
-                    caller_symbol_id, callee_symbol_id, edge_type,
-                    provenance, confidence, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    caller_symbol_id, callee_symbol_id, edge_type
+                ) VALUES (?, ?, ?)
                 ON CONFLICT(caller_symbol_id, callee_symbol_id, edge_type) DO UPDATE SET
-                    provenance = excluded.provenance,
-                    confidence = excluded.confidence,
-                    metadata_json = excluded.metadata_json
+                    edge_type = excluded.edge_type
                 RETURNING edge_id;
                 """,
                 (
                     caller_symbol_id,
                     callee_symbol_id,
                     edge_type,
-                    provenance,
-                    confidence,
-                    meta_json,
                 ),
             )
             row = cursor.fetchone()
-            return int(row["edge_id"])
+            edge_id = int(row["edge_id"])
 
-    def get_edges_for_caller(self, caller_symbol_id: int) -> List[Dict[str, Any]]:
-        """Retrieve all outgoing graph edges for a given caller symbol."""
+            # Also record default evidence if provenance is provided
+            if provenance:
+                conn.execute(
+                    """
+                    INSERT INTO graph_edge_evidence (
+                        edge_id, resolution_method, confidence, evidence_json, is_active
+                    ) VALUES (?, ?, ?, ?, 1);
+                    """,
+                    (
+                        edge_id,
+                        provenance,
+                        confidence,
+                        json.dumps(metadata or {}),
+                    ),
+                )
+            return edge_id
+
+    def insert_edge_evidence(
+        self,
+        edge_id: int,
+        resolution_method: str,
+        confidence: float,
+        evidence: Optional[Dict[str, Any]] = None,
+        commit_sha: Optional[str] = None,
+    ) -> int:
+        """Insert an independent evidence record for a logical graph edge."""
+        evidence_str = json.dumps(evidence or {})
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO graph_edge_evidence (
+                    edge_id, resolution_method, confidence, evidence_json, indexed_commit, is_active
+                ) VALUES (?, ?, ?, ?, ?, 1)
+                RETURNING evidence_id;
+                """,
+                (edge_id, resolution_method, confidence, evidence_str, commit_sha),
+            )
+            row = cursor.fetchone()
+            return int(row["evidence_id"])
+
+    def get_active_edge_evidence(self, edge_id: int) -> List[Dict[str, Any]]:
+        """Retrieve all active evidence records for an edge."""
         with self._get_connection() as conn:
             rows = conn.execute(
-                "SELECT * FROM graph_edges WHERE caller_symbol_id = ?;",
+                "SELECT * FROM graph_edge_evidence WHERE edge_id = ? AND is_active = 1;",
+                (edge_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def invalidate_file_symbols(self, file_id: int) -> None:
+        """Invalidate edge evidence and dependent candidate paths for symbols in file."""
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                UPDATE graph_edge_evidence
+                SET is_active = 0
+                WHERE edge_id IN (
+                    SELECT edge_id FROM graph_edges
+                    WHERE caller_symbol_id IN (SELECT symbol_id FROM symbols WHERE file_id = ?)
+                       OR callee_symbol_id IN (SELECT symbol_id FROM symbols WHERE file_id = ?)
+                );
+                """,
+                (file_id, file_id),
+            )
+            conn.execute(
+                """
+                UPDATE scan_candidate_paths
+                SET state = 'UNRESOLVED'
+                WHERE sink_id IN (SELECT sink_id FROM candidate_sinks WHERE file_id = ?);
+                """,
+                (file_id,),
+            )
+
+    @staticmethod
+    def compute_finding_fingerprint(
+        schema_version: int,
+        vuln_class: str,
+        norm_endpoint: str,
+        norm_source: str,
+        norm_sink: str,
+        norm_path: str,
+    ) -> str:
+        """Compute versioned, normalized SHA256 finding fingerprint across scans."""
+        raw = (
+            f"v{schema_version}|{vuln_class.strip().upper()}|{norm_endpoint.strip()}|"
+            f"{norm_source.strip()}|{norm_sink.strip()}|{norm_path.strip()}"
+        )
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def get_edges_for_caller(self, caller_symbol_id: int) -> List[Dict[str, Any]]:
+        """Retrieve all outgoing graph edges for a given caller symbol with active evidence."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT e.*,
+                       COALESCE(ev.resolution_method, 'DETERMINISTIC') as provenance,
+                       COALESCE(ev.confidence, 1.0) as confidence
+                FROM graph_edges e
+                LEFT JOIN graph_edge_evidence ev ON e.edge_id = ev.edge_id AND ev.is_active = 1
+                WHERE e.caller_symbol_id = ?;
+                """,
                 (caller_symbol_id,),
             ).fetchall()
             return [dict(r) for r in rows]
@@ -399,30 +518,42 @@ class DatabaseManager:
         title: str,
         vuln_class: str,
         severity: str,
-        cwe_id: str,
+        cwe_id: Optional[str],
         verdict: str,
-        confidence: float,
-        source_trace: Dict[str, Any] | List[Any],
-        sanitizer_analysis: Dict[str, Any],
+        confidence: Optional[float] = None,
+        reachability_confidence: float = 1.0,
+        exploitability_confidence: float = 0.85,
+        source_trace: Optional[Dict[str, Any] | List[Any]] = None,
+        sanitizer_analysis: Optional[Dict[str, Any]] = None,
+        evidence_bundle: Optional[Dict[str, Any]] = None,
+        finding_fingerprint: Optional[str] = None,
+        fingerprint_schema_version: int = 1,
         repro_curl_template: Optional[str] = None,
+        repro_template: Optional[Dict[str, Any]] = None,
         mitigation_notes: Optional[str] = None,
     ) -> None:
         """Record verified vulnerability dossier for a scan."""
-        trace_json = json.dumps(source_trace)
-        analysis_json = json.dumps(sanitizer_analysis)
+        trace_json = json.dumps(source_trace or [])
+        analysis_json = json.dumps(sanitizer_analysis or {})
+        bundle_json = json.dumps(evidence_bundle or {})
+        repro_json = json.dumps(repro_template) if repro_template else None
+        eff_conf = confidence if confidence is not None else exploitability_confidence
         with self.transaction() as conn:
             conn.execute(
                 """
                 INSERT INTO scan_dossiers (
-                    dossier_id, scan_id, path_id, engine_fingerprint, title,
-                    vuln_class, severity, cwe_id, verdict, confidence,
-                    source_trace_json, sanitizer_analysis_json,
-                    repro_curl_template, mitigation_notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    dossier_id, scan_id, fingerprint_schema_version, finding_fingerprint,
+                    path_id, engine_fingerprint, title, vuln_class, severity, cwe_id,
+                    verdict, reachability_confidence, exploitability_confidence, confidence,
+                    source_trace_json, sanitizer_analysis_json, evidence_bundle_json,
+                    repro_curl_template, repro_template_json, mitigation_notes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     dossier_id,
                     scan_id,
+                    fingerprint_schema_version,
+                    finding_fingerprint,
                     path_id,
                     engine_fingerprint,
                     title,
@@ -430,10 +561,14 @@ class DatabaseManager:
                     severity,
                     cwe_id,
                     verdict,
-                    confidence,
+                    reachability_confidence,
+                    exploitability_confidence,
+                    eff_conf,
                     trace_json,
                     analysis_json,
+                    bundle_json,
                     repro_curl_template,
+                    repro_json,
                     mitigation_notes,
                 ),
             )

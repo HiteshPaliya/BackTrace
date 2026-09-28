@@ -13,11 +13,18 @@ CREATE TABLE IF NOT EXISTS files (
     is_vendor BOOLEAN DEFAULT 0,
     file_hash TEXT NOT NULL,
     loc INTEGER NOT NULL,
+    execution_domain TEXT DEFAULT 'APPLICATION_RUNTIME',
+    runtime_role TEXT DEFAULT 'UNKNOWN',
+    environment TEXT DEFAULT 'PRODUCTION',
+    artifact_type TEXT DEFAULT 'UNKNOWN',
+    classification_confidence REAL DEFAULT 0.8,
+    classification_evidence TEXT,
     last_indexed_commit TEXT,
     last_indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_files_path ON files(rel_path);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(file_hash);
+CREATE INDEX IF NOT EXISTS idx_files_domain ON files(execution_domain, runtime_role);
 
 -- Symbols (functions, methods, classes, interfaces)
 CREATE TABLE IF NOT EXISTS symbols (
@@ -36,7 +43,7 @@ CREATE TABLE IF NOT EXISTS symbols (
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON symbols(file_id, name);
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
 
--- Discovered Endpoints (OWASP Noir + Heuristic AST)
+-- Discovered Endpoints (Framework Resolvers + OWASP Noir)
 CREATE TABLE IF NOT EXISTS endpoints (
     endpoint_id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
@@ -44,6 +51,7 @@ CREATE TABLE IF NOT EXISTS endpoints (
     route_pattern TEXT NOT NULL,
     handler_symbol_id INTEGER REFERENCES symbols(symbol_id) ON DELETE SET NULL,
     line_number INTEGER NOT NULL,
+    auth_state TEXT CHECK(auth_state IN ('REQUIRED', 'NOT_REQUIRED', 'UNKNOWN')) NOT NULL DEFAULT 'UNKNOWN',
     auth_required BOOLEAN DEFAULT 0,
     parameters_json TEXT, -- JSON array of {name, in, type, required}
     tool_provenance TEXT NOT NULL,
@@ -51,13 +59,13 @@ CREATE TABLE IF NOT EXISTS endpoints (
 );
 CREATE INDEX IF NOT EXISTS idx_endpoints_route ON endpoints(http_method, route_pattern);
 
--- Discovered Candidate Sinks (Semgrep + Tree-sitter AST)
+-- Discovered Candidate Sinks (Built-in Semantic AST + Semgrep)
 CREATE TABLE IF NOT EXISTS candidate_sinks (
     sink_id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL REFERENCES files(file_id) ON DELETE CASCADE,
     symbol_id INTEGER REFERENCES symbols(symbol_id) ON DELETE SET NULL,
-    vuln_class TEXT NOT NULL, -- e.g., 'RCE', 'SQLI', 'SSRF', 'PATH_TRAVERSAL'
-    severity TEXT CHECK(severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL,
+    vuln_class TEXT NOT NULL,
+    triage_severity TEXT CHECK(triage_severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL,
     line_number INTEGER NOT NULL,
     cwe_id TEXT,
     sink_expression TEXT NOT NULL,
@@ -67,18 +75,29 @@ CREATE TABLE IF NOT EXISTS candidate_sinks (
 );
 CREATE INDEX IF NOT EXISTS idx_sinks_class ON candidate_sinks(vuln_class);
 
--- Cross-File Graph Edges (Direct calls, imports, dynamic dispatches)
+-- Cross-File Logical Graph Edges
 CREATE TABLE IF NOT EXISTS graph_edges (
     edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
     caller_symbol_id INTEGER NOT NULL REFERENCES symbols(symbol_id) ON DELETE CASCADE,
     callee_symbol_id INTEGER NOT NULL REFERENCES symbols(symbol_id) ON DELETE CASCADE,
-    edge_type TEXT CHECK(edge_type IN ('CALL', 'IMPORT', 'INHERITS', 'DYNAMIC_DISPATCH', 'EVENT_EMIT')) NOT NULL,
-    provenance TEXT CHECK(provenance IN ('DETERMINISTIC', 'AGENT_INFERRED', 'HEURISTIC_CANDIDATE')) NOT NULL,
-    confidence REAL CHECK(confidence >= 0.0 AND confidence <= 1.0) NOT NULL,
-    metadata_json TEXT,
+    edge_type TEXT NOT NULL, -- 'CALL', 'IMPORT', 'INHERITS', 'DYNAMIC_DISPATCH', 'EVENT_EMIT', 'HANDLED_BY', 'GUARDED_BY', 'CONTAINS_SINK'
     UNIQUE(caller_symbol_id, callee_symbol_id, edge_type)
 );
 CREATE INDEX IF NOT EXISTS idx_edges_traversal ON graph_edges(caller_symbol_id, callee_symbol_id);
+
+-- Edge Evidence Records (Allows multiple independent corroborations per logical edge)
+CREATE TABLE IF NOT EXISTS graph_edge_evidence (
+    evidence_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    edge_id INTEGER NOT NULL REFERENCES graph_edges(edge_id) ON DELETE CASCADE,
+    resolution_method TEXT NOT NULL, -- 'FRAMEWORK_RESOLVER', 'DETERMINISTIC_AST', 'SCIP_LSIF', 'HEURISTIC_CALL', 'LINKER_AGENT'
+    confidence REAL CHECK(confidence >= 0.0 AND confidence <= 1.0) NOT NULL,
+    evidence_json TEXT,
+    indexed_commit TEXT,
+    is_active BOOLEAN DEFAULT 1,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_edge_evidence_edge ON graph_edge_evidence(edge_id);
+CREATE INDEX IF NOT EXISTS idx_edge_evidence_active ON graph_edge_evidence(is_active);
 
 -- Vendor Signatures (Shallow 3rd-party library sink mappings)
 CREATE TABLE IF NOT EXISTS vendor_signatures (
@@ -112,13 +131,14 @@ CREATE INDEX IF NOT EXISTS idx_scans_status ON scans(status);
 
 -- Candidate Reachability Paths evaluated in a specific scan
 CREATE TABLE IF NOT EXISTS scan_candidate_paths (
-    path_id TEXT PRIMARY KEY, -- SHA256 of scan_id + endpoint_id + sink_id + call_sequence
+    path_id TEXT PRIMARY KEY,
     scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
     endpoint_id INTEGER REFERENCES endpoints(endpoint_id) ON DELETE CASCADE,
     sink_id INTEGER NOT NULL REFERENCES candidate_sinks(sink_id) ON DELETE CASCADE,
     hop_count INTEGER NOT NULL,
     call_sequence_json TEXT NOT NULL, -- Array of symbol_ids and edge_ids
     priority_score REAL NOT NULL,
+    reachability_confidence REAL DEFAULT 1.0,
     state TEXT CHECK(state IN (
         'QUEUED', 'RUNNING', 'RESOLVED', 'UNRESOLVED',
         'PATH_PRUNED_DEPTH_LIMIT', 'PATH_PRUNED_BUDGET',
@@ -135,23 +155,31 @@ CREATE INDEX IF NOT EXISTS idx_paths_triage ON scan_candidate_paths(scan_id, sta
 CREATE TABLE IF NOT EXISTS scan_dossiers (
     dossier_id TEXT PRIMARY KEY,
     scan_id TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+    fingerprint_schema_version INTEGER NOT NULL DEFAULT 1,
+    finding_fingerprint TEXT,
     path_id TEXT REFERENCES scan_candidate_paths(path_id) ON DELETE SET NULL,
-    engine_fingerprint TEXT NOT NULL, -- Matched against scan for reuse validity
+    engine_fingerprint TEXT NOT NULL,
     title TEXT NOT NULL,
     vuln_class TEXT NOT NULL,
-    severity TEXT CHECK(severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')) NOT NULL,
-    cwe_id TEXT NOT NULL,
+    severity TEXT CHECK(severity IN ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO')) NOT NULL,
+    cwe_id TEXT,
     verdict TEXT CHECK(verdict IN (
         'EXPLOITABLE', 
         'LIKELY_EXPLOITABLE_PARTIAL_SANITIZATION', 
         'SAFE_PROVEN', 
         'INSUFFICIENT_CONTEXT'
     )) NOT NULL,
-    confidence REAL NOT NULL,
+    reachability_confidence REAL DEFAULT 1.0,
+    exploitability_confidence REAL DEFAULT 0.85,
+    confidence REAL DEFAULT 0.85,
     source_trace_json TEXT NOT NULL,
-    sanitizer_analysis_json TEXT NOT NULL, -- Curated structured evidence ONLY (no private CoT)
+    sanitizer_analysis_json TEXT,
+    evidence_bundle_json TEXT,
     repro_curl_template TEXT,
+    repro_template_json TEXT,
     mitigation_notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+CREATE INDEX IF NOT EXISTS idx_dossiers_finding_fp ON scan_dossiers(finding_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_dossiers_verdict ON scan_dossiers(scan_id, verdict, severity);
+CREATE INDEX IF NOT EXISTS idx_dossiers_fingerprint ON scan_dossiers(engine_fingerprint, path_id);
