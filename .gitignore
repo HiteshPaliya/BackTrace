@@ -42,3 +42,40 @@ htmlcov/
 # Project Audit State & Outputs
 .audit/
 .superpowers/
+
+# Documentation, Architecture Diagrams & Planning Specs
+docs/
+SPEC.md
+TASKLIST.md
+architecture.mmd
+*.mmd
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+
+# Editor & IDE Files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Node & NPM Artifacts
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Secrets & Environment Variables
+.env
+.env.*
+*.env
+
+# Logs
+*.log
