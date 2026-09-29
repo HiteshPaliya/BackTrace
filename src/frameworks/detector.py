@@ -13,7 +13,7 @@ class FrameworkDetector:
 
     def identify(self) -> Optional[str]:
         """Identify the primary web framework used in the repository."""
-        # 1. Node.js frameworks via package.json
+        # 1. Node.js frameworks via package.json and lockfiles
         pkg_json = self.repo_path / "package.json"
         if pkg_json.is_file():
             try:
@@ -30,7 +30,21 @@ class FrameworkDetector:
             except Exception:
                 pass
 
-        # 2. Python frameworks via requirements.txt or pyproject.toml
+        for lockfile in ["pnpm-lock.yaml", "package-lock.json", "yarn.lock"]:
+            lf_path = self.repo_path / lockfile
+            if lf_path.is_file():
+                try:
+                    text = lf_path.read_text(encoding="utf-8", errors="replace").lower()
+                    if "express" in text:
+                        return "express"
+                    if "fastify" in text:
+                        return "fastify"
+                    if "@nestjs/core" in text:
+                        return "nestjs"
+                except Exception:
+                    pass
+
+        # 2. Python frameworks via requirements.txt, pyproject.toml, or poetry.lock
         req_txt = self.repo_path / "requirements.txt"
         if req_txt.is_file():
             try:
@@ -43,6 +57,20 @@ class FrameworkDetector:
                     return "flask"
             except Exception:
                 pass
+
+        for py_conf in ["poetry.lock", "pyproject.toml", "Pipfile"]:
+            py_path = self.repo_path / py_conf
+            if py_path.is_file():
+                try:
+                    text = py_path.read_text(encoding="utf-8", errors="replace").lower()
+                    if "fastapi" in text:
+                        return "fastapi"
+                    if "django" in text:
+                        return "django"
+                    if "flask" in text:
+                        return "flask"
+                except Exception:
+                    pass
 
         # 3. Source code scanning heuristics (imports)
         for p in self.repo_path.rglob("*"):

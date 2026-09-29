@@ -69,3 +69,44 @@ def test_express_unauthenticated_route(tmp_path: Path):
     custom_ep = next((e for e in endpoints if e.route_pattern == "/custom"), None)
     assert custom_ep is not None
     assert custom_ep.auth_state == "UNKNOWN"
+
+
+def test_framework_detector_lockfiles_and_chained_routes(tmp_path: Path):
+    """Spec 5.1 & 5.2: Detects framework from lockfiles and resolves router.route() chains."""
+    # Test lockfile detection
+    pnpm_lock = tmp_path / "pnpm-lock.yaml"
+    pnpm_lock.write_text(
+        "lockfileVersion: 5.4\nspecifiers:\n  express: ^4.18.2\n", encoding="utf-8"
+    )
+    detector = FrameworkDetector(tmp_path)
+    assert detector.identify() == "express"
+
+    # Test router.route() pattern
+    api_js = tmp_path / "api.js"
+    api_js.write_text(
+        """
+        const express = require('express');
+        const router = express.Router();
+        router.route('/items')
+            .get(getItems)
+            .post(createItem);
+        """,
+        encoding="utf-8",
+    )
+    resolver = ExpressResolver(tmp_path)
+    endpoints = resolver.resolve_endpoints()
+
+    items_get = next(
+        (e for e in endpoints if e.route_pattern == "/items" and e.http_method == "GET"),
+        None,
+    )
+    items_post = next(
+        (e for e in endpoints if e.route_pattern == "/items" and e.http_method == "POST"),
+        None,
+    )
+
+    assert items_get is not None
+    assert items_get.handler_symbol == "getItems"
+    assert items_post is not None
+    assert items_post.handler_symbol == "createItem"
+

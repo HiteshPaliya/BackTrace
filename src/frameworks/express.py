@@ -25,6 +25,12 @@ class ExpressResolver(BaseFrameworkResolver):
     ROUTE_CALL_PATTERN = re.compile(
         r"""(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*['"]([^'"]+)['"]\s*,([^)]+)\)"""
     )
+    CHAINED_ROUTE_PATTERN = re.compile(
+        r"""(?:app|router)\.route\s*\(\s*['"]([^'"]+)['"]\s*\)((?:\s*\.(?:get|post|put|delete|patch)\s*\([^)]+\))+)"""
+    )
+    METHOD_CALL_PATTERN = re.compile(
+        r"""\.(get|post|put|delete|patch)\s*\(([^)]+)\)"""
+    )
 
     def resolve_endpoints(self) -> List[FrameworkEndpoint]:
         """Walk repository and deterministically resolve endpoints with prefix and middleware."""
@@ -121,6 +127,36 @@ class ExpressResolver(BaseFrameworkResolver):
                         auth_state=auth_state,
                     )
                 )
+
+            # Also check for chained router.route('/path').get(...).post(...)
+            for match in self.CHAINED_ROUTE_PATTERN.finditer(content):
+                route_subpath = match.group(1)
+                chain_body = match.group(2)
+                composed_path = f"{prefix}/{route_subpath.lstrip('/')}"
+                if not composed_path.startswith("/"):
+                    composed_path = "/" + composed_path
+
+                for call_m in self.METHOD_CALL_PATTERN.finditer(chain_body):
+                    method = call_m.group(1).upper()
+                    args_str = call_m.group(2)
+                    arg_tokens = [a.strip() for a in args_str.split(",") if a.strip()]
+                    handler_symbol = arg_tokens[-1] if arg_tokens else None
+                    local_middleware = arg_tokens[:-1] if len(arg_tokens) > 1 else []
+                    all_middleware = list(global_middleware) + local_middleware
+                    auth_state = self._determine_auth_state(all_middleware)
+                    line_no = content[: match.start()].count("\n") + 1
+
+                    endpoints.append(
+                        FrameworkEndpoint(
+                            http_method=method,
+                            route_pattern=composed_path,
+                            file_path=rel_path,
+                            line_number=line_no,
+                            handler_symbol=handler_symbol,
+                            middleware=all_middleware,
+                            auth_state=auth_state,
+                        )
+                    )
 
         return endpoints
 
