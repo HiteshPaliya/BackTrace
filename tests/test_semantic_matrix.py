@@ -90,3 +90,32 @@ def test_nosqli_lowercase_collection_and_direct_xxe_import():
     sink_types = {s.vuln_class for s in findings.sinks}
     assert "NOSQLI" in sink_types
     assert "XXE" in sink_types
+
+
+def test_polyglot_python_and_code_eval_sinks():
+    """Spec 6.1: Detects code evaluation (eval/Function) and polyglot Python sinks."""
+    py_code = """
+        import requests
+        import subprocess
+
+        def run_check(user_url, user_cmd):
+            requests.get(user_url)
+            subprocess.run(user_cmd, shell=True)
+    """
+    js_code = """
+        function runCode(userCode) {
+            eval(userCode);
+            new Function(userCode)();
+        }
+    """
+    detector = SemanticDetector()
+    py_findings = detector.scan_source("app.py", py_code, "python")
+    js_findings = detector.scan_source("evaluator.js", js_code, "javascript")
+
+    py_sinks = {s.vuln_class for s in py_findings.sinks}
+    assert "SSRF" in py_sinks
+    assert "RCE" in py_sinks
+
+    js_sinks = {s.vuln_class for s in js_findings.sinks}
+    assert "RCE" in js_sinks
+

@@ -47,7 +47,7 @@ class SemanticDetector:
         # SSRF
         (
             re.compile(
-                r"""\b(?:needle|axios|urllib\.request)\.(?:get|post|put|delete|head)\s*\([^)]+\)"""
+                r"""\b(?:needle|axios|urllib\.request|requests)\.(?:get|post|put|delete|head)\s*\([^)]+\)"""
                 r"""|\bfetch\s*\([^)]+\)|\brequest\s*\([^)]+\)"""
             ),
             "SSRF",
@@ -97,10 +97,11 @@ class SemanticDetector:
             "CWE-22",
             "FILESYSTEM_ACCESS",
         ),
-        # Command Execution (RCE)
+        # Command Execution & Code Evaluation (RCE)
         (
             re.compile(
-                r"""\b(?:child_process\.exec|os\.system|subprocess\.Popen)\s*\([^)]+\)"""
+                r"""\b(?:child_process\.exec|os\.system|os\.popen|subprocess\.(?:Popen|run|call)|"""
+                r"""eval|vm\.runInContext|new\s+Function)\s*\([^)]+\)"""
             ),
             "RCE",
             "CRITICAL",
