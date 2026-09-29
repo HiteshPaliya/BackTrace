@@ -21,7 +21,10 @@ class AuthzAnalysisResult:
 class AuthorizationAnalyzer:
     """Analyzes entity retrievals for missing principal-to-object authorization constraints."""
 
-    OBJECT_PARAM_PATTERN = re.compile(r"""\breq\.params\.(?:[a-zA-Z0-9_$]*id|id)\b""")
+    OBJECT_PARAM_PATTERN = re.compile(
+        r"""\breq\.(?:params|query|body)\.(?:[a-zA-Z0-9_$]*id|id)\b""",
+        re.IGNORECASE,
+    )
     PRINCIPAL_PATTERN = re.compile(
         r"""\b(?:req\.user\.id|token\.sub|session\.userId|current_user\.id|req\.user\.tenantId)\b"""
     )
@@ -35,6 +38,10 @@ class AuthorizationAnalyzer:
     )
     POST_FETCH_GUARD_PATTERN = re.compile(
         r"""if\s*\([^)]*(?:userId|ownerid|tenantid)[^)]*!==?[^)]*req\.user\.id[^)]*\)""",
+        re.IGNORECASE,
+    )
+    ROLE_GUARD_PATTERN = re.compile(
+        r"""if\s*\([^)]*(?:req\.user\.(?:role|roles)|is_admin|isAdmin|hasRole|hasPermission)[^)]*\)""",
         re.IGNORECASE,
     )
 
@@ -55,16 +62,30 @@ class AuthorizationAnalyzer:
         if not object_key and not has_route_id:
             return AuthzAnalysisResult(has_gap=False, status="NO_OBJECT_KEY")
 
-        # 2. Check for query scoping (safe scoped lookup)
-        if self.SCOPED_QUERY_PATTERN.search(code):
+        # 2. Check for Role / Permission guards
+        if self.ROLE_GUARD_PATTERN.search(code):
             return AuthzAnalysisResult(
                 has_gap=False,
                 status="AUTHZ_CONSTRAINT_PRESENT",
                 object_key=object_key,
-                relationship_type="OWNER",
+                relationship_type="ROLE",
             )
 
-        # 3. Check for post-retrieval ownership assertions
+        # 3. Check for query scoping (safe scoped lookup)
+        if self.SCOPED_QUERY_PATTERN.search(code):
+            rel_type = (
+                "TENANT"
+                if re.search(r"\b(?:tenantid|tenant_id)\b", code, re.IGNORECASE)
+                else "OWNER"
+            )
+            return AuthzAnalysisResult(
+                has_gap=False,
+                status="AUTHZ_CONSTRAINT_PRESENT",
+                object_key=object_key,
+                relationship_type=rel_type,
+            )
+
+        # 4. Check for post-retrieval ownership assertions
         if self.POST_FETCH_GUARD_PATTERN.search(code):
             return AuthzAnalysisResult(
                 has_gap=False,

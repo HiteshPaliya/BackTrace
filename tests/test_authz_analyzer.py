@@ -81,3 +81,38 @@ def test_authz_analyzer_detects_unscoped_findone_in_juiceshop_basket():
     assert res.gap_type == "CANDIDATE_AUTHZ_GAP"
     assert res.object_key == "req.params.id"
 
+
+def test_authz_analyzer_tenant_and_role_relationships():
+    """Spec 6.2: Analyzes TENANT scoping, ROLE-based checks, and query-param object keys."""
+    analyzer = AuthorizationAnalyzer()
+
+    # Tenant-scoped query
+    tenant_code = """
+        function getInvoice(req, res) {
+            const invoiceId = req.query.invoiceId;
+            Invoice.findOne({ where: { id: invoiceId, tenantId: req.user.tenantId } }).then(inv => {
+                res.json(inv);
+            });
+        }
+    """
+    tenant_res = analyzer.analyze_handler("GET", "/invoice", tenant_code, "javascript")
+    assert tenant_res.has_gap is False
+    assert tenant_res.status == "AUTHZ_CONSTRAINT_PRESENT"
+    assert tenant_res.relationship_type == "TENANT"
+
+    # Role-based admin guard
+    role_code = """
+        function deleteAccount(req, res) {
+            const userId = req.body.userId;
+            if (req.user.role !== 'admin') {
+                return res.status(403).send("Admin only");
+            }
+            Account.destroy({ where: { id: userId } });
+        }
+    """
+    role_res = analyzer.analyze_handler("POST", "/account/delete", role_code, "javascript")
+    assert role_res.has_gap is False
+    assert role_res.status == "AUTHZ_CONSTRAINT_PRESENT"
+    assert role_res.relationship_type == "ROLE"
+
+
