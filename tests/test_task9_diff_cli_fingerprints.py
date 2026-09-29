@@ -268,3 +268,80 @@ def test_cli_report_diff_integration(tmp_path: Path):
     res_diff = runner.invoke(cli, ["diff", str(tmp_path)])
     assert res_diff.exit_code == 0
     assert "Changed files:" in res_diff.output
+
+
+def test_deleted_file_end_to_end_invalidation_and_unrelated_retention(tmp_path: Path):
+    """Spec 7.4: Deleting a file via diff purges symbols and edge evidence."""
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "config", "user.name", "Tester"], cwd=tmp_path, capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+    )
+
+    fv = tmp_path / "vuln.py"
+    fu = tmp_path / "unrelated.py"
+    fv.write_text("def vuln(): pass\n", encoding="utf-8")
+    fu.write_text("def unrelated(): pass\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=tmp_path, capture_output=True, check=True)
+
+    db = DatabaseManager(tmp_path / ".audit" / "audit.db")
+    db.init_schema()
+
+    fv_id = db.upsert_file("vuln.py", "python", False, "h_vuln", 1)
+    fu_id = db.upsert_file("unrelated.py", "python", False, "h_unrelated", 1)
+
+    s_v = db.insert_symbol(fv_id, "vuln", "FUNCTION", 1, 0, 1, 10)
+    s_u = db.insert_symbol(fu_id, "unrelated", "FUNCTION", 1, 0, 1, 10)
+    edge_id = db.insert_graph_edge(s_v, s_u, "CALL", provenance="DETERMINISTIC", confidence=1.0)
+
+    diff_engine = GitDiffEngine(tmp_path, db)
+    fp = diff_engine.compute_engine_fingerprint({"config": "v1"})
+    scan_id = db.create_scan(str(tmp_path), "FULL", fp)
+
+    sink_v = db.insert_candidate_sink(fv_id, "RCE", "CRITICAL", 1, "os.system()", "r1", "Semgrep")
+    sink_u = db.insert_candidate_sink(fu_id, "SQLI", "HIGH", 1, "db.query()", "r2", "Semgrep")
+
+    db.record_candidate_path("p_v", scan_id, sink_v, 1, [s_v], 0.9)
+    db.record_candidate_path("p_u", scan_id, sink_u, 1, [s_u], 0.8)
+
+    db.record_dossier(
+        "dos_v", scan_id, "p_v", fp, "Vuln in vuln", "RCE", "CRITICAL", "CWE-78", "EXPLOITABLE"
+    )
+    db.record_dossier(
+        "dos_u", scan_id, "p_u", fp, "Vuln in unrel", "SQLI", "HIGH", "CWE-89", "EXPLOITABLE"
+    )
+
+    # Delete vuln.py on filesystem (simulating developer deletion)
+    fv.unlink()
+
+    # 1. Run compute_impact through the real GitDiffEngine path
+    plan = diff_engine.compute_impact(base_ref="HEAD", current_config={"config": "v1"})
+
+    # 2. Verify deleted_files captures vuln.py
+    assert any(p.name == "vuln.py" for p in plan.deleted_files)
+
+    # 3. Verify symbols, sinks, files are deleted via CASCADE
+    with db._get_connection() as conn:
+        assert conn.execute("SELECT * FROM files WHERE rel_path = 'vuln.py';").fetchone() is None
+        assert conn.execute("SELECT * FROM symbols WHERE symbol_id = ?;", (s_v,)).fetchone() is None
+        sink_check = "SELECT * FROM candidate_sinks WHERE sink_id = ?;"
+        assert conn.execute(sink_check, (sink_v,)).fetchone() is None
+
+    # 4. Verify dependent edge evidence cannot remain active
+    assert len(db.get_active_edge_evidence(edge_id)) == 0
+
+    # 5. Verify deleted dossier is excluded and unrelated dossier is retained
+    assert "dos_v" not in plan.reusable_dossier_ids
+    assert "dos_u" in plan.reusable_dossier_ids
+
+    # 6. Verify subsequent run does not resurrect stale evidence
+    plan_next = diff_engine.compute_impact(base_ref="HEAD", current_config={"config": "v1"})
+    assert "dos_v" not in plan_next.reusable_dossier_ids
+    assert "dos_u" in plan_next.reusable_dossier_ids
+    assert len(db.get_active_edge_evidence(edge_id)) == 0
