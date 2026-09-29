@@ -59,3 +59,11 @@ def test_graph_json_export_scoping(tmp_path: Path):
     sym_graph = exporter.export(db, scope="symbol", symbol_name="funcA")
     assert len(sym_graph["nodes"]) == 1
     assert sym_graph["nodes"][0]["name"] == "funcA"
+
+    # Scoped export to path
+    scan_id = db.create_scan(str(tmp_path), "FULL", "fp_graph")
+    sink_id = db.insert_candidate_sink(f1, "SQLI", "HIGH", 10, "db.query()", "r1", "tool")
+    db.record_candidate_path("path_123", scan_id, sink_id, 2, ["ep_1", "sym_1", "sink_1"], 0.9)
+    path_graph = exporter.export(db, scope="path", path_id="path_123")
+    assert len(path_graph["nodes"]) == 3
+    assert path_graph["nodes"][0]["path_id"] == "path_123"

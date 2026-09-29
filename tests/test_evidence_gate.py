@@ -72,3 +72,22 @@ def test_evidence_bundle_zero_cot():
     bundle_str = str(bundle).lower()
     for forbidden in ["<thought>", "scratchpad", "prosecutor:", "defender:"]:
         assert forbidden not in bundle_str
+
+
+def test_max_agent_turns_per_path_circuit_breaker():
+    """Global constraint: Exceeding 8 agent turns per path triggers circuit breaker."""
+    from src.agents.verifier import EvidenceBundle
+
+    verifier = EvidenceGateVerifier()
+    # 9 turns exceeds limit of 8
+    bundle_exceeded = EvidenceBundle(
+        source_node={"route": "/api/test"},
+        path_trace=[{"node": "ep"}, {"node": "sink"}],
+        sink_node={"vuln_class": "RCE"},
+        reachability_confidence=0.90,
+        bypass_reasoning="Valid path",
+        agent_turns=9,
+    )
+    res = verifier.evaluate_contract(evidence_bundle=bundle_exceeded)
+    assert res.verdict == VerdictStatus.INSUFFICIENT_CONTEXT
+    assert "8 agent turns" in res.bypass_reasoning

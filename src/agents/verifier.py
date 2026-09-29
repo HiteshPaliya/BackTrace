@@ -19,6 +19,7 @@ class EvidenceBundle:
     bypass_reasoning: Optional[str] = None
     has_effective_sanitizer: bool = False
     has_partial_sanitizer: bool = False
+    agent_turns: int = 0
 
 
 @dataclass
@@ -36,6 +37,8 @@ class VerificationResult:
 class EvidenceGateVerifier:
     """Enforces strict evidence thresholds before assigning canonical verdicts."""
 
+    MAX_AGENT_TURNS_PER_PATH: int = 8
+
     def __init__(self, llm_client: Any = None) -> None:
         self.llm = llm_client
 
@@ -51,10 +54,27 @@ class EvidenceGateVerifier:
     ) -> VerificationResult:
         """Evaluate evidence sufficiency against security contracts."""
         if evidence_bundle is not None:
-            # Invariant 7: Verifier evaluates strictly from EvidenceBundle
+            # Circuit breaker: Max 8 agent turns per path
             reach_conf = evidence_bundle.reachability_confidence
+            if evidence_bundle.agent_turns > self.MAX_AGENT_TURNS_PER_PATH:
+                return VerificationResult(
+                    verdict=VerdictStatus.INSUFFICIENT_CONTEXT,
+                    reachability_confidence=reach_conf,
+                    exploitability_confidence=0.0,
+                    confidence=0.0,
+                    evidence_bundle={
+                        "circuit_breaker": "EXCEEDED_MAX_AGENT_TURNS_8",
+                        "agent_turns": evidence_bundle.agent_turns,
+                    },
+                    bypass_reasoning=(
+                        "Circuit breaker triggered: Exceeded max 8 agent turns per path"
+                    ),
+                )
+
+            # Invariant 7: Verifier evaluates strictly from EvidenceBundle
             has_source = evidence_bundle.source_node is not None
             has_path = bool(evidence_bundle.path_trace)
+            has_sink = evidence_bundle.sink_node is not None
             reasoning = evidence_bundle.bypass_reasoning or ""
             auth = evidence_bundle.auth_state
 
@@ -65,18 +85,19 @@ class EvidenceGateVerifier:
                 "transforms_count": len(evidence_bundle.transforms),
                 "auth_state": auth,
                 "reachability_confidence": reach_conf,
+                "agent_turns": evidence_bundle.agent_turns,
                 "bypass_reasoning": self._sanitize_cot(reasoning),
             }
 
             # Invariant 7 & 8: Insufficient CPG evidence -> INSUFFICIENT_CONTEXT
-            if not has_source or not has_path or reach_conf < 0.60:
+            if not has_source or not has_path or not has_sink or reach_conf < 0.60:
                 return VerificationResult(
                     verdict=VerdictStatus.INSUFFICIENT_CONTEXT,
                     reachability_confidence=reach_conf,
                     exploitability_confidence=0.0,
                     confidence=0.0,
                     evidence_bundle=bundle_dict,
-                    bypass_reasoning="Insufficient CPG path or source-control evidence",
+                    bypass_reasoning="Insufficient CPG path, source, or sink evidence",
                 )
 
             if evidence_bundle.has_effective_sanitizer:
