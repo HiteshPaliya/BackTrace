@@ -38,21 +38,43 @@ class SARIFExporter:
             line_no = first_loc.get("line", 1)
             msg_text = f"{d.get('title')}: {d.get('verdict')} (confidence: {d.get('confidence')})"
 
-            results.append(
-                {
-                    "ruleId": rule_id,
-                    "level": sev_level,
-                    "message": {"text": msg_text},
-                    "locations": [
+            # Build codeFlows from trace if available
+            code_flows = []
+            if isinstance(trace, list) and trace:
+                thread_flow_locs = []
+                for step in trace:
+                    f = step.get("file", file_path)
+                    ln = step.get("line", line_no)
+                    thread_flow_locs.append(
                         {
-                            "physicalLocation": {
-                                "artifactLocation": {"uri": file_path},
-                                "region": {"startLine": int(line_no)},
+                            "location": {
+                                "physicalLocation": {
+                                    "artifactLocation": {"uri": f},
+                                    "region": {"startLine": int(ln)},
+                                },
+                                "message": {"text": f"Trace step in {f}:{ln}"},
                             }
                         }
-                    ],
-                }
-            )
+                    )
+                code_flows.append({"threadFlows": [{"locations": thread_flow_locs}]})
+
+            result_entry = {
+                "ruleId": rule_id,
+                "level": sev_level,
+                "message": {"text": msg_text},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": file_path},
+                            "region": {"startLine": int(line_no)},
+                        }
+                    }
+                ],
+            }
+            if code_flows:
+                result_entry["codeFlows"] = code_flows
+
+            results.append(result_entry)
 
         return {
             "$schema": self.SARIF_SCHEMA,

@@ -67,3 +67,45 @@ def test_graph_json_export_scoping(tmp_path: Path):
     path_graph = exporter.export(db, scope="path", path_id="path_123")
     assert len(path_graph["nodes"]) == 3
     assert path_graph["nodes"][0]["path_id"] == "path_123"
+
+
+def test_sarif_export_embeds_code_flows():
+    """Spec 10.1: SARIF exporter embeds step-by-step codeFlows matching verified path traces."""
+    import json
+
+    from src.reporting.sarif import SARIFExporter
+
+    dossiers = [
+        {
+            "dossier_id": "D1",
+            "title": "SQL Injection in Search",
+            "vuln_class": "SQLI",
+            "severity": "CRITICAL",
+            "cwe_id": "CWE-89",
+            "verdict": "EXPLOITABLE",
+            "confidence": 0.85,
+            "source_trace_json": json.dumps([
+                {"file": "routes/search.ts", "line": 20},
+                {"file": "routes/search.ts", "line": 23},
+            ]),
+        }
+    ]
+
+    exporter = SARIFExporter()
+    sarif = exporter.export(dossiers)
+
+    assert sarif["version"] == "2.1.0"
+
+    res = sarif["runs"][0]["results"][0]
+    assert "codeFlows" in res
+
+    thread_flows = res["codeFlows"][0]["threadFlows"][0]["locations"]
+    assert len(thread_flows) == 2
+
+    first_uri = (
+        thread_flows[0]["location"]
+        ["physicalLocation"]
+        ["artifactLocation"]
+        ["uri"]
+    )
+    assert first_uri == "routes/search.ts"
