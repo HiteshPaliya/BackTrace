@@ -501,9 +501,168 @@ def report(scan_id: str, export_format: str, target: Optional[str], output: str 
 
 @cli.command()
 @click.argument("scan_id")
-def resume(scan_id: str):
+@click.option(
+    "--target",
+    default=None,
+    help="Target repository directory or database path containing .audit/audit.db.",
+)
+def resume(scan_id: str, target: Optional[str] = None):
     """Resume a paused or interrupted scan."""
+    db_path: Optional[Path] = None
+    if target:
+        p = Path(target).resolve()
+        if (p / ".audit" / "audit.db").exists():
+            db_path = p / ".audit" / "audit.db"
+        elif p.is_file():
+            db_path = p
+
+    if not db_path:
+        if Path(".audit/audit.db").exists():
+            db_path = Path(".audit/audit.db")
+        else:
+            for candidate in Path(".").glob("**/audit.db"):
+                db_path = candidate
+                break
+
+    if not db_path or not db_path.exists():
+        console.print("[red]No audit database found[/red]")
+        sys.exit(1)
+
+    db = DatabaseManager(db_path)
     console.print(f"[bold cyan]Resuming scan:[/bold cyan] {scan_id}")
+
+    with db._get_connection() as conn:
+        paths = conn.execute(
+            """
+            SELECT p.*, s.vuln_class, s.sink_expression, s.raw_rule_id,
+                   s.triage_severity, f.rel_path
+            FROM scan_candidate_paths p
+            JOIN candidate_sinks s ON p.sink_id = s.sink_id
+            JOIN files f ON s.file_id = f.file_id
+            WHERE p.scan_id = ? AND p.state IN ('QUEUED', 'UNRESOLVED', 'RUNNING');
+            """,
+            (scan_id,),
+        ).fetchall()
+
+    if not paths:
+        console.print(f"[green]Scan {scan_id} is already complete; no pending paths.[/green]")
+        db.update_scan_status(scan_id, "COMPLETED")
+        return
+
+    cpg = CodePropertyGraph()
+    cpg.load_from_db(db)
+    analyzer = ReachabilityAnalyzer(cpg)
+    from src.agents.verifier import EvidenceBundle, EvidenceGateVerifier
+    from src.reporting.synthesizer import DossierSynthesizer
+
+    verifier = EvidenceGateVerifier()
+    synthesizer = DossierSynthesizer()
+
+    with db._get_connection() as conn:
+        scan_row = conn.execute("SELECT * FROM scans WHERE scan_id = ?;", (scan_id,)).fetchone()
+        fingerprint = scan_row["engine_fingerprint"] if scan_row else "fp_resumed"
+        endpoints = conn.execute("SELECT * FROM endpoints;").fetchall()
+
+    for p in paths:
+        path_id = p["path_id"]
+        sink_id = p["sink_id"]
+
+        matching_ep = None
+        proven_path = None
+        for ep in endpoints:
+            f_paths = analyzer.find_paths(
+                f"ep_{ep['endpoint_id']}", f"sink_{sink_id}", max_hops=20
+            )
+            if f_paths:
+                matching_ep = ep
+                proven_path = f_paths[0]
+                break
+
+        if matching_ep:
+            ep_method = matching_ep["http_method"]
+            ep_route = matching_ep["route_pattern"]
+            reach_conf = proven_path.reachability_confidence if proven_path else 0.85
+            ev_bundle = EvidenceBundle(
+                source_node={"method": ep_method, "route": ep_route},
+                path_trace=proven_path.nodes if proven_path else [{"file": p["rel_path"]}],
+                sink_node={
+                    "vuln_class": p["vuln_class"],
+                    "expression": p["sink_expression"],
+                },
+                auth_state=matching_ep.get("auth_state", "NOT_REQUIRED"),
+                reachability_confidence=reach_conf,
+                bypass_reasoning=f"Resumed: Tainted input reaches {p['vuln_class']} sink",
+            )
+            blueprint = synthesizer.generate_reproduction_template(
+                endpoint_method=ep_method,
+                route_pattern=ep_route,
+                auth_state=matching_ep.get("auth_state", "NOT_REQUIRED"),
+                tainted_param={"location": "QUERY", "name": "q"},
+                sink_target=p["sink_expression"][:50],
+            )
+            repro_curl = blueprint["curl_command"]
+        else:
+            ep_method = None
+            ep_route = None
+            reach_conf = 0.0
+            ev_bundle = EvidenceBundle(
+                source_node=None,
+                path_trace=None,
+                sink_node={
+                    "vuln_class": p["vuln_class"],
+                    "expression": p["sink_expression"],
+                },
+                auth_state="UNKNOWN",
+                reachability_confidence=0.0,
+                bypass_reasoning="Resumed: No CPG path proven",
+            )
+            blueprint = {"reproduction_type": "NONE"}
+            repro_curl = None
+
+        v_res = verifier.evaluate_contract(evidence_bundle=ev_bundle)
+        norm_ep_str = f"{ep_method} {ep_route}" if ep_method else "N/A"
+        finding_fp = db.compute_finding_fingerprint(
+            schema_version=1,
+            vuln_class=p["vuln_class"],
+            norm_endpoint=norm_ep_str,
+            norm_source="req.input" if matching_ep else "internal",
+            norm_sink=p["raw_rule_id"],
+            norm_path=p["rel_path"],
+        )
+
+        dossier_id = f"dos_{scan_id[:8]}_{sink_id}"
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE scan_candidate_paths SET state = 'RESOLVED', reachability_confidence = ? "
+                "WHERE path_id = ?;",
+                (reach_conf, path_id),
+            )
+
+        db.record_dossier(
+            dossier_id=dossier_id,
+            scan_id=scan_id,
+            path_id=path_id,
+            engine_fingerprint=fingerprint,
+            title=f"{p['vuln_class']} in {Path(p['rel_path']).name}",
+            vuln_class=p["vuln_class"],
+            severity=p["triage_severity"],
+            cwe_id="CWE-Unknown",
+            verdict=v_res.verdict.value,
+            reachability_confidence=v_res.reachability_confidence,
+            exploitability_confidence=v_res.exploitability_confidence,
+            confidence=v_res.confidence,
+            source_trace=[{"file": p["rel_path"]}],
+            sanitizer_analysis={"bypass_reasoning": v_res.bypass_reasoning},
+            evidence_bundle=v_res.evidence_bundle,
+            finding_fingerprint=finding_fp,
+            fingerprint_schema_version=1,
+            repro_curl_template=repro_curl,
+            repro_template=blueprint,
+            mitigation_notes=f"Sanitize input before {p['vuln_class']} sink.",
+        )
+
+    db.update_scan_status(scan_id, "COMPLETED")
+    console.print(f"[bold green]Resumed scan completed successfully:[/bold green] {scan_id}")
 
 
 def main():

@@ -452,6 +452,11 @@ class DatabaseManager:
                 (file_id,),
             )
 
+    def invalidate_deleted_file(self, rel_path: str) -> None:
+        """Purge deleted file and cascade invalidation through symbols and edges."""
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM files WHERE rel_path = ?;", (rel_path,))
+
     @staticmethod
     def compute_finding_fingerprint(
         schema_version: int,
@@ -461,10 +466,15 @@ class DatabaseManager:
         norm_sink: str,
         norm_path: str,
     ) -> str:
-        """Compute versioned, normalized SHA256 finding fingerprint across scans."""
+        """Compute versioned, normalized SHA256 finding fingerprint (line-churn immune)."""
+        clean_path = (
+            norm_path.split(":")[0].strip()
+            if ":" in norm_path and not norm_path.startswith("http")
+            else norm_path.strip()
+        )
         raw = (
             f"v{schema_version}|{vuln_class.strip().upper()}|{norm_endpoint.strip()}|"
-            f"{norm_source.strip()}|{norm_sink.strip()}|{norm_path.strip()}"
+            f"{norm_source.strip()}|{norm_sink.strip()}|{clean_path}"
         )
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -653,7 +663,18 @@ class DatabaseManager:
                     verdict, reachability_confidence, exploitability_confidence, confidence,
                     source_trace_json, sanitizer_analysis_json, evidence_bundle_json,
                     repro_curl_template, repro_template_json, mitigation_notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(dossier_id) DO UPDATE SET
+                    verdict = excluded.verdict,
+                    reachability_confidence = excluded.reachability_confidence,
+                    exploitability_confidence = excluded.exploitability_confidence,
+                    confidence = excluded.confidence,
+                    source_trace_json = excluded.source_trace_json,
+                    sanitizer_analysis_json = excluded.sanitizer_analysis_json,
+                    evidence_bundle_json = excluded.evidence_bundle_json,
+                    repro_curl_template = excluded.repro_curl_template,
+                    repro_template_json = excluded.repro_template_json,
+                    mitigation_notes = excluded.mitigation_notes;
                 """,
                 (
                     dossier_id,

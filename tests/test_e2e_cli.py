@@ -159,7 +159,7 @@ def test_e2e_cli_scan_diff_report_resume(tmp_path: Path):
     with db._get_connection() as conn:
         edges_before = conn.execute("SELECT count(*) as cnt FROM graph_edges;").fetchone()["cnt"]
 
-    resume_res = runner.invoke(cli, ["resume", scan_id])
+    resume_res = runner.invoke(cli, ["resume", scan_id, "--target", str(fixture_dir)])
     assert resume_res.exit_code == 0
     assert scan_id in resume_res.output
 

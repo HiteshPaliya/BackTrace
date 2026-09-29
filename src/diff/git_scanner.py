@@ -18,6 +18,7 @@ class DiffImpactPlan:
     unaffected_files: List[Path]
     engine_fingerprint: str
     reusable_dossier_ids: List[str] = field(default_factory=list)
+    deleted_files: List[Path] = field(default_factory=list)
 
 
 class GitDiffEngine:
@@ -32,11 +33,28 @@ class GitDiffEngine:
     RESOLVER_VERSION = "0.2.0"
 
     def compute_engine_fingerprint(self, config: Dict[str, Any]) -> str:
-        """Compute deterministic SHA256 engine fingerprint based on config, rules, and models."""
+        """Compute SHA256 engine fingerprint based on engine, schema, tools, and lockfiles."""
+        lockfile_hash = "none"
+        for lf_name in [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+        ]:
+            lf = self.repo_path / lf_name
+            if lf.is_file():
+                try:
+                    lockfile_hash = hashlib.sha256(lf.read_bytes()).hexdigest()
+                    break
+                except OSError:
+                    pass
+
         metadata = {
             "engine_version": self.ENGINE_VERSION,
             "schema_version": self.SCHEMA_VERSION,
             "resolver_version": self.RESOLVER_VERSION,
+            "lockfile_hash": lockfile_hash,
             **config,
         }
         canonical_json = json.dumps(metadata, sort_keys=True)
@@ -113,6 +131,11 @@ class GitDiffEngine:
             for rel in changed_rel_paths
             if (self.repo_path / rel).is_file()
         ]
+        deleted_files = [
+            self.repo_path / rel
+            for rel in changed_rel_paths
+            if not (self.repo_path / rel).exists()
+        ]
 
         # 3. Query all indexed files in DB to determine unaffected files
         indexed_files = self.db.get_all_files()
@@ -121,6 +144,26 @@ class GitDiffEngine:
             for f in indexed_files
             if f["rel_path"].replace("\\", "/") not in changed_rel_paths
         ]
+
+        # Invalidate deleted files immediately in SQLite CPG
+        for df in deleted_files:
+            try:
+                rel = str(df.relative_to(self.repo_path)).replace("\\", "/")
+                self.db.invalidate_deleted_file(rel)
+            except ValueError:
+                pass
+
+        # Invalidate modified files
+        for cf in changed_files:
+            try:
+                rel = str(cf.relative_to(self.repo_path)).replace("\\", "/")
+                f_row = next(
+                    (f for f in indexed_files if f["rel_path"].replace("\\", "/") == rel), None
+                )
+                if f_row:
+                    self.db.invalidate_file_symbols(f_row["file_id"])
+            except ValueError:
+                pass
 
         # 4. Strict Version Gating: Check reusable dossiers
         reusable_ids: List[str] = []
@@ -144,4 +187,5 @@ class GitDiffEngine:
             unaffected_files=unaffected_files,
             engine_fingerprint=curr_fingerprint,
             reusable_dossier_ids=reusable_ids,
+            deleted_files=deleted_files,
         )
